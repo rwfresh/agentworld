@@ -1,0 +1,139 @@
+name: agentworld
+
+x-app-environment: &app-environment
+  NODE_ENV: development
+  HOST: 0.0.0.0
+  PORT: 3000
+  BASE_URL: ${BASE_URL:-http://localhost:3000}
+  TRUST_PROXY_HOPS: 0
+  AUTH_SECRET: ${AUTH_SECRET:-agentworld-local-only-change-before-sharing-2026}
+  WORLD_SEED_SECRET: ${WORLD_SEED_SECRET:-agentworld-local-world-seed-only-change-2026}
+  METRICS_TOKEN: ${METRICS_TOKEN:-agentworld-local-metrics-token-only-change-2026}
+  AUTH_MODE: better-auth
+  REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
+  INSTALLATION_NAME: ${INSTALLATION_NAME:-Local AgentWorld}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-agentworld}:${POSTGRES_PASSWORD:-agentworld_dev}@postgres:5432/${POSTGRES_DB:-agentworld}
+  REDIS_URL: redis://valkey:6379
+  RULESET_PATH: /app/config/rulesets/beta-v1.yaml
+  AUTH_WEB_DIRECTORY: /app/apps/auth-web/dist
+  GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  SMTP_URL: smtp://mailpit:1025
+  EMAIL_FROM: ${EMAIL_FROM:-AgentWorld Local <agentworld@localhost>}
+
+x-app-build: &app-build
+  context: .
+  dockerfile: infra/docker/Dockerfile
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agentworld}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentworld_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-agentworld}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18+ uses a versioned PGDATA under this parent mount.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "127.0.0.1:${VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.27.9
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: 500
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    volumes:
+      - mailpit-data:/data
+
+  migrate:
+    build: *app-build
+    environment: *app-environment
+    command: ["node", "apps/server/dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    build: *app-build
+    environment: *app-environment
+    command: ["node", "apps/server/dist/seed.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build: *app-build
+    restart: unless-stopped
+    init: true
+    environment: *app-environment
+    command: ["node", "apps/server/dist/api.js"]
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    stop_grace_period: 45s
+
+  worker:
+    build: *app-build
+    restart: unless-stopped
+    init: true
+    environment: *app-environment
+    command: ["node", "apps/server/dist/worker.js"]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    stop_grace_period: 45s
+
+volumes:
+  postgres-data:
+  mailpit-data:

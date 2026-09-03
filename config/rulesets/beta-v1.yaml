@@ -1,0 +1,81 @@
+id: beta-v1
+generation: { algorithm: fnv1a-32-v1 }
+ticksPerSecond: 1
+map:
+  width: 192
+  height: 192
+  regionSize: 16
+  starterReserveSize: 64
+  contestedSize: 128
+  starterPlotSize: 2
+  maxStarterPlots: 512
+startingResources:
+  energy: 100
+  materials: 100
+  inference: 50
+structures:
+  command-node:
+    cost: { energy: 0, materials: 0, inference: 0 }
+    buildTimeTicks: 0
+    maxHp: 250
+    influence: 0
+    starterOnly: true
+  generator:
+    cost: { energy: 10, materials: 60, inference: 0 }
+    buildTimeTicks: 120
+    maxHp: 100
+    production: { resource: energy, amount: 5 }
+    influence: 10
+  extractor:
+    cost: { energy: 20, materials: 75, inference: 0 }
+    buildTimeTicks: 180
+    maxHp: 120
+    production: { resource: materials, amount: 3 }
+    influence: 15
+  compute-node:
+    cost: { energy: 40, materials: 80, inference: 0 }
+    buildTimeTicks: 300
+    maxHp: 90
+    production: { resource: inference, amount: 2 }
+    influence: 20
+  defense-node:
+    cost: { energy: 60, materials: 120, inference: 20 }
+    buildTimeTicks: 480
+    maxHp: 180
+    influence: 25
+movement:
+  cooldownTicks: 2
+  terrainEnergyCost: { plains: 1, forest: 2, hills: 3, wetlands: 4 }
+construction: { concurrentLimit: 2 }
+production: { intervalTicks: 600, offlineCapTicks: 86400 }
+look: { radius: 1 }
+scan: { radius: 3, inferenceCost: 5, cooldownTicks: 30 }
+harvest: { energyCost: 3, baseYield: 5, cooldownTicks: 60 }
+combat:
+  hostilityWarmupTicks: 900
+  retaliationAfterWithdrawalTicks: 900
+  attackCooldownTicks: 120
+  energyCost: 20
+  inferenceCost: 5
+  baseDamage: 30
+  maxBonusInference: 10
+  damagePerBonusInference: 2
+  defenseReduction: 15
+  minimumDamage: 1
+  weakOpponentPowerRatio: 0.5
+  influencePerDestruction: 25
+  influencePerOpponentWindow: 100
+  influenceWindowTicks: 86400
+trust:
+  tier1SuccessfulMutations: 5
+  tier1CompletedStructures: 1
+  tier2AgeTicks: 3600
+  tier2SuccessfulMutations: 20
+  tier2EarnedResources: 100
+scoring:
+  contestedTile: 10
+  frontierTile: 25
+  energyPerPoint: 100
+  materialsPerPoint: 50
+  inferencePerPoint: 25
+season: { durationTicks: 2419200, allianceFreezeTicks: 259200 }

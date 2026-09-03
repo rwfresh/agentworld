@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "tsBuildInfoFile": "node_modules/.cache/auth-web.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"]
+}

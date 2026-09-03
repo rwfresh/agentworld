@@ -1,0 +1,59 @@
+name: Container
+
+on:
+  pull_request:
+    paths:
+      - apps/**
+      - packages/**
+      - config/**
+      - infra/docker/**
+      - .dockerignore
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .github/workflows/container.yml
+  push:
+    branches:
+      - main
+    paths:
+      - apps/**
+      - packages/**
+      - config/**
+      - infra/docker/**
+      - .dockerignore
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .github/workflows/container.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build production image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Validate Compose model
+        run: docker compose config --quiet
+
+      - name: Build production image
+        run: >-
+          docker build
+          --file infra/docker/Dockerfile
+          --tag agentworld:${{ github.sha }}
+          .
+
+      - name: Verify image runs as non-root
+        run: >-
+          test "$(docker image inspect
+          --format '{{.Config.User}}'
+          agentworld:${{ github.sha }})" = "node"

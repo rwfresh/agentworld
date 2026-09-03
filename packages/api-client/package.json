@@ -1,0 +1,32 @@
+{
+  "name": "@agentworld/api-client",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Typed HTTP client for AgentWorld",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "test": "vitest run --root ../.. packages/api-client/tests",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@agentworld/api-contract": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
