@@ -102,16 +102,33 @@ export function resolveInstallationIdentity(
   return { id: existing.id, name: existing.name, change: "keep" };
 }
 
-/** Wall-clock scheduling needs an exact season length; a ruleset that would round is rejected. */
+/**
+ * Wall-clock scheduling needs an exact season length; a ruleset that would round is rejected. The
+ * division is checked in integer arithmetic: a floating-point quotient can round to a safe integer
+ * even though the exact quotient is fractional.
+ */
 export function seasonDurationMilliseconds(ruleset: {
   readonly ticksPerSecond: number;
   readonly season: { readonly durationTicks: number };
 }): number {
-  const milliseconds = (ruleset.season.durationTicks * 1_000) / ruleset.ticksPerSecond;
-  if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0) {
+  const { ticksPerSecond } = ruleset;
+  const { durationTicks } = ruleset.season;
+  if (!Number.isSafeInteger(ticksPerSecond) || ticksPerSecond <= 0) {
+    throw new Error("ruleset ticksPerSecond must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(durationTicks) || durationTicks <= 0) {
+    throw new Error("ruleset season durationTicks must be a positive safe integer");
+  }
+  const scaled = BigInt(durationTicks) * 1_000n;
+  const divisor = BigInt(ticksPerSecond);
+  if (scaled % divisor !== 0n) {
     throw new Error("ruleset season duration is not exactly representable in milliseconds");
   }
-  return milliseconds;
+  const milliseconds = scaled / divisor;
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("ruleset season duration in milliseconds exceeds the safe integer range");
+  }
+  return Number(milliseconds);
 }
 
 function normalizedJson(value: unknown): Json {

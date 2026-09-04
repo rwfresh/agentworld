@@ -150,9 +150,14 @@ session fixation, excessive scope, development-auth exposure.
 - Current: operator-issued invitation values carry 120 bits of randomness and
   are stored only as SHA-256 hashes with bounded expiry and use counts. A
   successful first-time magic-link request atomically consumes a use and binds
-  a 24-hour reservation to the SHA-256 digest of the normalized email in the
-  dedicated `invitation_reservations` table; the `security_audit` row
-  references the invitation and reservation IDs only, never the address. Every
+  a 24-hour reservation to an HMAC-SHA-256 digest of the normalized email in
+  the dedicated `invitation_reservations` table. The digest key is derived from
+  `AUTH_SECRET` under a fixed label, so a reader of the table cannot confirm
+  guessed addresses offline; rows backfilled with the unkeyed SHA-256 digest
+  before this change are honoured only until they expire (within 24 hours) and
+  are never written again, and rotating `AUTH_SECRET` orphans in-flight
+  reservations for the same window. The `security_audit` row references the
+  invitation and reservation IDs only, never the address. Every
   sign-up path, including first-time GitHub OAuth, passes through the
   fail-closed `user.create.before` gate, which rejects with the explicit codes
   `INVITATION_REQUIRED` or `REGISTRATION_CLOSED`; the portal reads the
@@ -314,10 +319,12 @@ operator access, inability to erase mutable personal content.
 
 - Three domains: immutable game/economic events; restricted security/operator
   audit; deletable/tombstonable messages, reports, email, and PII.
-- Current: invitation reservations store only the SHA-256 digest of the
-  normalized email, and the related security-audit rows reference invitation
-  and reservation IDs. Database triggers reject UPDATE, DELETE, and TRUNCATE on
-  the game event and resource-ledger journals.
+- Current: invitation reservations store only a keyed HMAC-SHA-256 digest of
+  the normalized email (key derived from `AUTH_SECRET`, so the stored value
+  cannot be matched offline against guessed addresses), and the related
+  security-audit rows reference invitation and reservation IDs. Database
+  triggers reject UPDATE, DELETE, and TRUNCATE on the game event and
+  resource-ledger journals.
 - Event payload allowlists—not denylist redaction—and tests proving arbitrary
   player strings cannot enter immutable storage.
 - Current Fastify/Pino request serialization allowlists only the method; request

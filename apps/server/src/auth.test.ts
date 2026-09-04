@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { APIError } from "better-auth/api";
 import { describe, expect, it } from "vitest";
 import {
@@ -9,7 +8,7 @@ import {
   type InvitationQueryResult,
   reserveInvitation,
 } from "./auth.ts";
-import { emailHash, invitationHash } from "./invitation-code.ts";
+import { createEmailDigester, invitationHash, legacyEmailHash } from "./invitation-code.ts";
 import { HttpProblem } from "./problem.ts";
 
 interface Statement {
@@ -26,6 +25,7 @@ interface FakeState {
 const email = " Player@Example.test ";
 const normalizedEmail = "player@example.test";
 const code = "AW-ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789";
+const digest = createEmailDigester("unit-test-auth-secret-with-at-least-32-characters");
 const empty: InvitationQueryResult = { rows: [], rowCount: 0 };
 
 function fakePool(state: FakeState) {
@@ -95,9 +95,9 @@ describe("auth request forwarding", () => {
 });
 
 describe("reserveInvitation", () => {
-  it("consumes one use, stores only the email digest, and audits the invitation rather than the email", async () => {
+  it("consumes one use, stores only the keyed email digest, and audits the invitation rather than the email", async () => {
     const fake = fakePool({ invitationId: "invitation-1" });
-    await reserveInvitation(fake.pool, email, code);
+    await reserveInvitation(fake.pool, digest(email), code);
 
     expect(fake.verbs()).toEqual([
       "begin",
@@ -108,12 +108,18 @@ describe("reserveInvitation", () => {
       "insert",
       "commit",
     ]);
+    const { current, accepted } = digest(email);
+    const lookup = fake.statements.find((statement) =>
+      statement.text.includes("from public.invitation_reservations"),
+    );
+    expect(lookup?.values).toEqual([accepted]);
+    expect(accepted).toEqual([current, legacyEmailHash(email)]);
     const [reservation, audit] = fake.statements.filter((statement) =>
       statement.text.trimStart().startsWith("insert"),
     );
-    const expectedDigest = createHash("sha256").update(normalizedEmail).digest("hex");
-    expect(emailHash(email)).toBe(expectedDigest);
-    expect(reservation?.values.slice(1)).toEqual(["invitation-1", expectedDigest]);
+    expect(reservation?.values.slice(1)).toEqual(["invitation-1", current]);
+    // The legacy digest is accepted for lookups but never written.
+    expect(reservation?.values).not.toContain(legacyEmailHash(email));
     expect(audit?.values[1]).toBe("invitation-1");
     expect(JSON.parse(String(audit?.values[2]))).toEqual({ reservationId: "reservation-row" });
     const usesCode = fake.statements.find((statement) =>
@@ -130,13 +136,13 @@ describe("reserveInvitation", () => {
 
   it("does not consume another use while a reservation is active", async () => {
     const fake = fakePool({ activeReservationId: "reservation-existing", invitationId: "unused" });
-    await reserveInvitation(fake.pool, email, code);
+    await reserveInvitation(fake.pool, digest(email), code);
     expect(fake.verbs()).toEqual(["begin", "select", "select", "commit"]);
   });
 
   it("rejects an invalid or exhausted invitation and rolls back", async () => {
     const fake = fakePool({});
-    await expect(reserveInvitation(fake.pool, email, code)).rejects.toMatchObject({
+    await expect(reserveInvitation(fake.pool, digest(email), code)).rejects.toMatchObject({
       status: 403,
       code: "INVITATION_INVALID",
     });
@@ -146,7 +152,7 @@ describe("reserveInvitation", () => {
 
   it("keeps the original failure when rollback fails and discards that connection", async () => {
     const fake = fakePool({ failRollback: true });
-    const failure = await reserveInvitation(fake.pool, email, code).catch(
+    const failure = await reserveInvitation(fake.pool, digest(email), code).catch(
       (error: unknown) => error,
     );
     expect(failure).toBeInstanceOf(HttpProblem);
@@ -158,10 +164,10 @@ describe("reserveInvitation", () => {
 
   it("requires a plausible code before touching the database", async () => {
     const fake = fakePool({ invitationId: "invitation-1" });
-    await expect(reserveInvitation(fake.pool, email, undefined)).rejects.toMatchObject({
+    await expect(reserveInvitation(fake.pool, digest(email), undefined)).rejects.toMatchObject({
       code: "INVITATION_REQUIRED",
     });
-    await expect(reserveInvitation(fake.pool, email, "AW")).rejects.toMatchObject({
+    await expect(reserveInvitation(fake.pool, digest(email), "AW")).rejects.toMatchObject({
       code: "INVITATION_REQUIRED",
     });
     expect(fake.connections).toBe(0);
@@ -170,7 +176,7 @@ describe("reserveInvitation", () => {
 });
 
 describe("findActiveReservation", () => {
-  it("looks up by digest only and ignores non-string ids", async () => {
+  it("looks up by the accepted digests only and ignores non-string ids", async () => {
     const seen: Statement[] = [];
     const runner = {
       async query(text: string, values: readonly unknown[] = []) {
@@ -178,8 +184,9 @@ describe("findActiveReservation", () => {
         return { rows: [{ id: 42 }], rowCount: 1 };
       },
     };
-    expect(await findActiveReservation(runner, emailHash(email))).toBeUndefined();
-    expect(seen[0]?.values).toEqual([emailHash(email)]);
+    expect(await findActiveReservation(runner, digest(email).accepted)).toBeUndefined();
+    expect(seen[0]?.text).toMatch(/email_hash = any\(\$1::text\[\]\)/);
+    expect(seen[0]?.values).toEqual([digest(email).accepted]);
     expect(JSON.stringify(seen)).not.toContain(normalizedEmail);
   });
 });
@@ -187,7 +194,9 @@ describe("findActiveReservation", () => {
 describe("createRegistrationGate", () => {
   it("lets open registration create users without a lookup", async () => {
     const fake = fakePool({});
-    await expect(createRegistrationGate("open", fake.pool)({ email })).resolves.toBeUndefined();
+    await expect(
+      createRegistrationGate("open", fake.pool, digest)({ email }),
+    ).resolves.toBeUndefined();
     expect(fake.statements).toEqual([]);
   });
 
@@ -196,6 +205,7 @@ describe("createRegistrationGate", () => {
     const failure = await createRegistrationGate(
       "closed",
       fake.pool,
+      digest,
     )({ email }).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(APIError);
     expect(failure).toMatchObject({
@@ -210,6 +220,7 @@ describe("createRegistrationGate", () => {
     const failure = await createRegistrationGate(
       "invite",
       withoutReservation.pool,
+      digest,
     )({
       email,
     }).catch((error: unknown) => error);
@@ -218,11 +229,22 @@ describe("createRegistrationGate", () => {
       statusCode: 403,
       body: { code: "INVITATION_REQUIRED", message: expect.stringMatching(/GitHub/) },
     });
-    expect(withoutReservation.statements[0]?.values).toEqual([emailHash(email)]);
+    expect(withoutReservation.statements[0]?.values).toEqual([digest(email).accepted]);
 
     const withReservation = fakePool({ activeReservationId: "reservation-1" });
     await expect(
-      createRegistrationGate("invite", withReservation.pool)({ email }),
+      createRegistrationGate("invite", withReservation.pool, digest)({ email }),
     ).resolves.toBeUndefined();
+  });
+
+  it("looks reservations up under the injected key, so a rotated secret sends other digests", async () => {
+    const rotated = createEmailDigester("rotated-unit-test-auth-secret-32-characters-long");
+    const fake = fakePool({});
+    await createRegistrationGate("invite", fake.pool, rotated)({ email }).catch(() => undefined);
+    const [sent] = fake.statements[0]?.values ?? [];
+    expect(sent).toEqual(rotated(email).accepted);
+    expect(sent).not.toEqual(digest(email).accepted);
+    // Only the keyed digest changes; the legacy digest stays recognisable until it expires.
+    expect(rotated(email).accepted[1]).toBe(digest(email).accepted[1]);
   });
 });

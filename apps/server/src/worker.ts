@@ -317,6 +317,16 @@ async function completeConstruction(
     .where("worldId", "=", structure.worldId)
     .executeTakeFirstOrThrow();
   if (structure.allianceId) {
+    // Each member's completion locks only its own player row, so the recompute serializes on the
+    // alliance row: without it two members' transactions could each write a total that omits the
+    // other's delta. Players are locked before alliances here, as on every other path.
+    await transaction
+      .selectFrom("alliances")
+      .select("id")
+      .where("worldId", "=", structure.worldId)
+      .where("id", "=", structure.allianceId)
+      .forUpdate()
+      .executeTakeFirstOrThrow();
     const members = await transaction
       .selectFrom("players")
       .select("influence")
@@ -376,8 +386,8 @@ async function completeConstruction(
 
 /**
  * Activates due structures one per transaction: each row is re-checked and locked with SKIP
- * LOCKED, then its state change, player progress, and audit event commit together. A failing row
- * is reported to `onRowFailure` and left due; the rest of the batch still completes.
+ * LOCKED, then its state change, player progress, alliance total, and audit event commit together.
+ * A failing row is reported to `onRowFailure` and left due; the rest of the batch still completes.
  */
 export async function completeDueConstructions(
   database: ServerDatabase,

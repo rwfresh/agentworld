@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { createDatabase } from "@agentworld/db";
 import { sql } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -46,6 +47,34 @@ function aggregateEvents(aggregateType: string, aggregateId: string) {
     .where("aggregateId", "=", aggregateId)
     .orderBy("aggregateVersion")
     .execute();
+}
+
+/**
+ * Resolves once a backend in this database waits on a row lock, which is how the blocked worker
+ * transaction shows up. Fails if `pending` settles first, surfacing its own error when it rejected.
+ */
+async function waitForLockWaiter(pending: Promise<unknown>): Promise<void> {
+  let settled = false;
+  const observed = pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  for (let attempt = 0; attempt < 400 && !settled; attempt += 1) {
+    const waiting = await sql<{ count: string }>`
+      select count(*)::text as count from pg_stat_activity
+      where datname = current_database() and wait_event_type = 'Lock'
+    `.execute(database);
+    if (waiting.rows[0]?.count !== "0") return;
+    await delay(25);
+  }
+  if (!settled) throw new Error("construction completion never waited on the alliance row lock");
+  await observed;
+  await pending;
+  throw new Error("construction completion settled before the alliance row lock was released");
 }
 
 beforeAll(async () => {
@@ -160,6 +189,111 @@ describe("durable worker on API-created rows", () => {
     ]);
     expect(await completeDueConstructions(database, now)).toBe(0);
     expect(await duplicateVersionCount()).toBe("0");
+  });
+
+  it("recomputes an alliance total only after acquiring the alliance row lock", async () => {
+    // Rows are inserted directly: this exercises the worker, not the alliance routes.
+    const allianceId = randomUUID();
+    await database
+      .insertInto("alliances")
+      .values({
+        id: allianceId,
+        worldId,
+        name: `Worker Alliance ${allianceId.slice(0, 8)}`,
+        leaderPlayerId: playerId,
+        disbandedAt: null,
+      })
+      .execute();
+    await database
+      .insertInto("allianceMembers")
+      .values([
+        { worldId, allianceId, playerId, role: "leader", leftAt: null },
+        { worldId, allianceId, playerId: partnerPlayerId, role: "member", leftAt: null },
+      ])
+      .execute();
+    await database
+      .updateTable("players")
+      .set({ allianceId })
+      .where("worldId", "=", worldId)
+      .where("id", "in", [playerId, partnerPlayerId])
+      .execute();
+
+    const built = await app.inject({
+      method: "POST",
+      url: `/v1/worlds/${worldId}/actions/build`,
+      headers: { ...partnerAuthorization, "idempotency-key": randomUUID() },
+      payload: { structure: "generator" },
+    });
+    expect(built.statusCode).toBe(200);
+    const structure = await database
+      .selectFrom("structures")
+      .select("id")
+      .where("worldId", "=", worldId)
+      .where("ownerPlayerId", "=", partnerPlayerId)
+      .where("status", "=", "constructing")
+      .executeTakeFirstOrThrow();
+    await database
+      .updateTable("structures")
+      .set({ completesAt: new Date(Date.now() - 60_000) })
+      .where("id", "=", structure.id)
+      .execute();
+    const partnerBefore = await database
+      .selectFrom("players")
+      .select("influence")
+      .where("id", "=", partnerPlayerId)
+      .executeTakeFirstOrThrow();
+
+    // Hold the alliance row as a concurrent member's completion would. While the worker waits for
+    // it, commit an influence change its total must include: a recompute that read the members
+    // before taking the lock would write a stale sum.
+    const locked = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    const holder = database.transaction().execute(async (transaction) => {
+      await transaction
+        .selectFrom("alliances")
+        .select("id")
+        .where("worldId", "=", worldId)
+        .where("id", "=", allianceId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
+      locked.resolve();
+      await released.promise;
+    });
+    await locked.promise;
+    const completion = completeDueConstructions(database, new Date());
+    await waitForLockWaiter(completion);
+    await database
+      .updateTable("players")
+      .set((expression) => ({ influence: expression("influence", "+", 1_000) }))
+      .where("worldId", "=", worldId)
+      .where("id", "=", playerId)
+      .execute();
+    released.resolve();
+    await holder;
+    expect(await completion).toBe(1);
+
+    const [members, alliance, partnerAfter] = await Promise.all([
+      database
+        .selectFrom("players")
+        .select("influence")
+        .where("worldId", "=", worldId)
+        .where("allianceId", "=", allianceId)
+        .execute(),
+      database
+        .selectFrom("alliances")
+        .select("influence")
+        .where("id", "=", allianceId)
+        .executeTakeFirstOrThrow(),
+      database
+        .selectFrom("players")
+        .select("influence")
+        .where("id", "=", partnerPlayerId)
+        .executeTakeFirstOrThrow(),
+    ]);
+    expect(members).toHaveLength(2);
+    expect(partnerAfter.influence).toBeGreaterThan(partnerBefore.influence);
+    expect(alliance.influence).toBe(members.reduce((sum, member) => sum + member.influence, 0));
+    expect(alliance.influence).toBeGreaterThanOrEqual(partnerAfter.influence + 1_000);
   });
 
   it("skips a poison trade row, still refunds its neighbour, and rejects negative escrow", async () => {

@@ -83,7 +83,7 @@ on an absent or unsafe required value.
 | `DATABASE_POOL_SIZE` | optional | Positive integer maximum of pooled connections per process (default 10); any other value fails startup |
 | `REDIS_URL` | hosted/multi-replica | Shared request-rate-limit store; omission falls back to per-process counters |
 | `BASE_URL` | yes | Exact public HTTPS origin; no path/trailing ambiguity |
-| `AUTH_SECRET` | yes | Unique random 256-bit value; shared by API/worker, secret store only |
+| `AUTH_SECRET` | yes | Unique random 256-bit value; shared by API/worker, secret store only. Also derives the key for invitation-reservation email digests, so a rotation orphans in-flight reservations for up to 24 hours (see [Registration invitations](#registration-invitations)) |
 | `WORLD_SEED_SECRET` | yes | Separate random 256-bit key; derives unpredictable reproducible per-season seeds and must never be published |
 | `METRICS_TOKEN` | hosted metrics | Random bearer credential required by `/metrics` in production |
 | `AUTH_MODE` | yes | `better-auth`; development mode must be rejected off loopback |
@@ -142,10 +142,11 @@ logs.
 
 A new email supplies the code in the auth portal together with the magic-link
 request. A valid request consumes one use and reserves that invitation for the
-normalized email for 24 hours in `invitation_reservations`, which stores only
-the SHA-256 digest of the address. The matching `security_audit` row
-(`invitation_reserved`) references the invitation and reservation IDs, never the
-email. Repeat magic-link requests for the same email during that window do not
+normalized email for 24 hours in `invitation_reservations`, which stores only an
+HMAC-SHA-256 digest of the address under a key derived from `AUTH_SECRET` with a
+fixed label, so a reader of the table cannot confirm guessed addresses offline.
+The matching `security_audit` row (`invitation_reserved`) references the
+invitation and reservation IDs, never the email. Repeat magic-link requests for the same email during that window do not
 consume another use; after the window a new request consumes one again. Email
 delivery failure can therefore consume a use. Existing accounts do not need a
 code, and `REGISTRATION_MODE=closed` rejects all new accounts. Setting
@@ -161,6 +162,15 @@ returns to the portal carrying that code. The portal reads `registration` from
 their invite code first; GitHub sign-in works once the account exists. Expired
 reservation rows carry no personal data and may be purged as routine
 maintenance.
+
+Rotating `AUTH_SECRET` also rotates the digest key, so reservations made before
+the rotation are no longer recognised: a first-time sign-in whose magic link was
+requested before the rotation is rejected with `INVITATION_REQUIRED`, and the
+invitee's next magic-link request consumes another use (or fails once the
+invitation is exhausted). Expect this for up to 24 hours after a rotation and
+re-issue invitations where needed. Rows written before the keyed digest was
+introduced carry the unkeyed SHA-256 digest; they are honoured for lookups until
+they expire and are never written again.
 
 ## Hosted deployment (Render)
 

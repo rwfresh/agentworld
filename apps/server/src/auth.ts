@@ -9,7 +9,13 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import nodemailer from "nodemailer";
 import { v7 as uuidv7 } from "uuid";
 import type { AppConfig, RegistrationMode } from "./config.ts";
-import { emailHash, invitationHash, normalizeEmail } from "./invitation-code.ts";
+import {
+  createEmailDigester,
+  type EmailDigest,
+  type EmailDigester,
+  invitationHash,
+  normalizeEmail,
+} from "./invitation-code.ts";
 import { HttpProblem } from "./problem.ts";
 
 export const gameScopes = [
@@ -127,31 +133,31 @@ function stringField(result: InvitationQueryResult, field: string): string | und
   return typeof value === "string" ? value : undefined;
 }
 
-/** Returns the id of an unexpired reservation for the hashed email, if one exists. */
+/** Returns the id of an unexpired reservation carrying any of the address's digests, if one exists. */
 export async function findActiveReservation(
   runner: InvitationQueryRunner,
-  hashedEmail: string,
+  digests: readonly string[],
 ): Promise<string | undefined> {
   const result = await runner.query(
     `select id from public.invitation_reservations
-     where email_hash = $1 and expires_at > now()
+     where email_hash = any($1::text[]) and expires_at > now()
      order by expires_at desc limit 1`,
-    [hashedEmail],
+    [digests],
   );
   return stringField(result, "id");
 }
 
 /**
- * Consumes one invitation use and binds it to the normalized email for 24 hours. Repeated requests
- * inside that window reuse the reservation. Only the SHA-256 email digest is stored; the audit row
- * references the invitation and reservation, never the address.
+ * Consumes one invitation use and binds it to the address for 24 hours. Repeated requests inside
+ * that window reuse the reservation, including one still stored under the legacy digest. Only the
+ * keyed email digest is stored; the audit row references the invitation and reservation, never the
+ * address, which this function never sees.
  */
 export async function reserveInvitation(
   pool: InvitationConnectionPool,
-  emailValue: string,
+  emailDigest: EmailDigest,
   codeValue: unknown,
 ): Promise<void> {
-  const hashedEmail = emailHash(emailValue);
   if (typeof codeValue !== "string" || codeValue.trim().length < 4) {
     throw new HttpProblem(403, "INVITATION_REQUIRED", "A valid invitation code is required");
   }
@@ -160,9 +166,9 @@ export async function reserveInvitation(
   try {
     await client.query("begin");
     await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `agentworld-invite:${hashedEmail}`,
+      `agentworld-invite:${emailDigest.current}`,
     ]);
-    if ((await findActiveReservation(client, hashedEmail)) === undefined) {
+    if ((await findActiveReservation(client, emailDigest.accepted)) === undefined) {
       const invitation = await client.query(
         `update public.invitations set uses = uses + 1
          where code_hash = $1 and revoked_at is null
@@ -181,7 +187,7 @@ export async function reserveInvitation(
          on conflict (invitation_id, email_hash) do update
            set reserved_at = excluded.reserved_at, expires_at = excluded.expires_at
          returning id`,
-        [uuidv7(), invitationId, hashedEmail],
+        [uuidv7(), invitationId, emailDigest.current],
       );
       await client.query(
         `insert into public.security_audit
@@ -217,6 +223,7 @@ export async function reserveInvitation(
 export function createRegistrationGate(
   mode: RegistrationMode,
   runner: InvitationQueryRunner,
+  digest: EmailDigester,
 ): RegistrationGate {
   return async (user) => {
     if (mode === "open") return;
@@ -226,7 +233,7 @@ export function createRegistrationGate(
         message: "Registration is closed; only existing accounts can sign in",
       });
     }
-    if ((await findActiveReservation(runner, emailHash(user.email))) === undefined) {
+    if ((await findActiveReservation(runner, digest(user.email).accepted)) === undefined) {
       throw APIError.from("FORBIDDEN", {
         code: "INVITATION_REQUIRED",
         message:
@@ -261,6 +268,7 @@ export function createAuthRuntime(config: AppConfig): AuthRuntime {
   }
 
   const authPool = createPool(withAuthSearchPath(config.databaseUrl));
+  const digest = createEmailDigester(config.authSecret);
   const transporter = config.smtpUrl ? nodemailer.createTransport(config.smtpUrl) : undefined;
   const socialProviders =
     config.githubClientId && config.githubClientSecret
@@ -284,7 +292,7 @@ export function createAuthRuntime(config: AppConfig): AuthRuntime {
           databaseHooks: {
             user: {
               create: {
-                before: createRegistrationGate(config.registrationMode, authPool),
+                before: createRegistrationGate(config.registrationMode, authPool, digest),
               },
             },
           },
@@ -380,7 +388,7 @@ export function createAuthRuntime(config: AppConfig): AuthRuntime {
                 return reply.code(200).send({ status: true });
               }
               try {
-                await reserveInvitation(authPool, email, input.inviteCode);
+                await reserveInvitation(authPool, digest(email), input.inviteCode);
               } catch (error) {
                 if (error instanceof HttpProblem && error.status === 403) {
                   return reply.code(200).send({ status: true });

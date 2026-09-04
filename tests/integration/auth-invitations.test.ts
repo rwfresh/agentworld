@@ -5,7 +5,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createRegistrationGate, reserveInvitation } from "../../apps/server/src/auth.ts";
 import { type AppConfig, readConfig } from "../../apps/server/src/config.ts";
 import { createInvitation } from "../../apps/server/src/create-invite.ts";
-import { emailHash } from "../../apps/server/src/invitation-code.ts";
+import {
+  createEmailDigester,
+  type EmailDigester,
+  legacyEmailHash,
+} from "../../apps/server/src/invitation-code.ts";
 import { runMigrations } from "../../apps/server/src/migrate.ts";
 import { seedBetaWorld } from "../../apps/server/src/seed.ts";
 
@@ -13,6 +17,7 @@ const uuidV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]
 let config: AppConfig;
 let database: ReturnType<typeof createDatabase>;
 let pool: ReturnType<typeof createPool>;
+let digest: EmailDigester;
 
 function invitation(maxUses: number) {
   return createInvitation(
@@ -35,6 +40,7 @@ beforeAll(async () => {
   await runMigrations(config);
   database = createDatabase(config.databaseUrl);
   pool = createPool(config.databaseUrl);
+  digest = createEmailDigester(config.authSecret);
 });
 
 afterAll(async () => {
@@ -43,17 +49,18 @@ afterAll(async () => {
 });
 
 describe("invitation reservations", () => {
-  it("binds an invitation to the email digest and audits the invitation, never the address", async () => {
+  it("binds an invitation to the keyed email digest and audits the invitation, never the address", async () => {
     const created = await invitation(2);
     const address = `Invitee.${randomUUID()}@Example.test`;
-    await reserveInvitation(pool, ` ${address} `, created.code);
+    await reserveInvitation(pool, digest(` ${address} `), created.code);
 
     const reservation = await database
       .selectFrom("invitationReservations")
       .selectAll()
       .where("invitationId", "=", created.id)
       .executeTakeFirstOrThrow();
-    expect(reservation.emailHash).toBe(emailHash(address));
+    expect(reservation.emailHash).toBe(digest(address).current);
+    expect(reservation.emailHash).not.toBe(legacyEmailHash(address));
     expect(reservation.expiresAt.getTime()).toBeGreaterThan(Date.now());
     expect(reservation.expiresAt.getTime() - reservation.reservedAt.getTime()).toBe(86_400_000);
 
@@ -75,7 +82,7 @@ describe("invitation reservations", () => {
     expect(persisted).not.toContain(created.code);
 
     // Repeat requests inside the window reuse the reservation instead of consuming another use.
-    await reserveInvitation(pool, address.toLowerCase(), created.code);
+    await reserveInvitation(pool, digest(address.toLowerCase()), created.code);
     const uses = await database
       .selectFrom("invitations")
       .select("uses")
@@ -94,32 +101,40 @@ describe("invitation reservations", () => {
   it("gates user creation on an active reservation, including OAuth sign-ups", async () => {
     const created = await invitation(1);
     const address = `gated-${randomUUID()}@example.test`;
-    const gate = createRegistrationGate("invite", pool);
+    const gate = createRegistrationGate("invite", pool, digest);
     await expect(gate({ email: address })).rejects.toMatchObject({
       statusCode: 403,
       body: { code: "INVITATION_REQUIRED" },
     });
 
-    await reserveInvitation(pool, address, created.code);
+    await reserveInvitation(pool, digest(address), created.code);
     await expect(gate({ email: address.toUpperCase() })).resolves.toBeUndefined();
     await expect(gate({ email: `stranger-${randomUUID()}@example.test` })).rejects.toMatchObject({
       body: { code: "INVITATION_REQUIRED" },
     });
-    await expect(createRegistrationGate("closed", pool)({ email: address })).rejects.toMatchObject({
+    await expect(
+      createRegistrationGate("closed", pool, digest)({ email: address }),
+    ).rejects.toMatchObject({
       statusCode: 403,
       body: { code: "REGISTRATION_CLOSED" },
     });
-    await expect(createRegistrationGate("open", pool)({ email: address })).resolves.toBeUndefined();
+    await expect(
+      createRegistrationGate("open", pool, digest)({ email: address }),
+    ).resolves.toBeUndefined();
   });
 
   it("rejects unknown and exhausted invitations without consuming a use", async () => {
     const created = await invitation(1);
     await expect(
-      reserveInvitation(pool, `unknown-${randomUUID()}@example.test`, "AW-NOT-A-REAL-CODE-2345"),
+      reserveInvitation(
+        pool,
+        digest(`unknown-${randomUUID()}@example.test`),
+        "AW-NOT-A-REAL-CODE-2345",
+      ),
     ).rejects.toMatchObject({ status: 403, code: "INVITATION_INVALID" });
-    await reserveInvitation(pool, `first-${randomUUID()}@example.test`, created.code);
+    await reserveInvitation(pool, digest(`first-${randomUUID()}@example.test`), created.code);
     await expect(
-      reserveInvitation(pool, `second-${randomUUID()}@example.test`, created.code),
+      reserveInvitation(pool, digest(`second-${randomUUID()}@example.test`), created.code),
     ).rejects.toMatchObject({ code: "INVITATION_INVALID" });
     const row = await database
       .selectFrom("invitations")
@@ -132,7 +147,7 @@ describe("invitation reservations", () => {
   it("stops honouring a reservation once its window has passed", async () => {
     const created = await invitation(1);
     const address = `expired-${randomUUID()}@example.test`;
-    await reserveInvitation(pool, address, created.code);
+    await reserveInvitation(pool, digest(address), created.code);
     await database
       .updateTable("invitationReservations")
       .set({
@@ -141,12 +156,86 @@ describe("invitation reservations", () => {
       })
       .where("invitationId", "=", created.id)
       .execute();
-    await expect(createRegistrationGate("invite", pool)({ email: address })).rejects.toMatchObject({
+    await expect(
+      createRegistrationGate("invite", pool, digest)({ email: address }),
+    ).rejects.toMatchObject({
       body: { code: "INVITATION_REQUIRED" },
     });
     // Renewing needs a remaining use; this single-use invitation is exhausted.
-    await expect(reserveInvitation(pool, address, created.code)).rejects.toMatchObject({
+    await expect(reserveInvitation(pool, digest(address), created.code)).rejects.toMatchObject({
       code: "INVITATION_INVALID",
+    });
+  });
+
+  it("honours a legacy unkeyed reservation for lookups while writing only keyed digests", async () => {
+    const created = await invitation(1);
+    const address = `legacy-${randomUUID()}@example.test`;
+    // Migration 007 backfilled live rows with the plain SHA-256 digest; their plaintext is gone.
+    await database
+      .insertInto("invitationReservations")
+      .values({
+        id: randomUUID(),
+        invitationId: created.id,
+        emailHash: legacyEmailHash(address),
+        expiresAt: new Date(Date.now() + 3_600_000),
+      })
+      .execute();
+    const gate = createRegistrationGate("invite", pool, digest);
+    await expect(gate({ email: address.toUpperCase() })).resolves.toBeUndefined();
+
+    // A repeat magic-link request reuses the legacy reservation instead of consuming the use.
+    await reserveInvitation(pool, digest(address), created.code);
+    const [uses, reservations] = await Promise.all([
+      database
+        .selectFrom("invitations")
+        .select("uses")
+        .where("id", "=", created.id)
+        .executeTakeFirstOrThrow(),
+      database
+        .selectFrom("invitationReservations")
+        .select("emailHash")
+        .where("invitationId", "=", created.id)
+        .execute(),
+    ]);
+    expect(uses.uses).toBe(0);
+    expect(reservations).toEqual([{ emailHash: legacyEmailHash(address) }]);
+
+    // Once the legacy row lapses, the renewed reservation is written with the keyed digest.
+    await database
+      .updateTable("invitationReservations")
+      .set({
+        reservedAt: new Date(Date.now() - 2 * 86_400_000),
+        expiresAt: new Date(Date.now() - 86_400_000),
+      })
+      .where("invitationId", "=", created.id)
+      .execute();
+    await expect(gate({ email: address })).rejects.toMatchObject({
+      body: { code: "INVITATION_REQUIRED" },
+    });
+    await reserveInvitation(pool, digest(address), created.code);
+    const renewed = await database
+      .selectFrom("invitationReservations")
+      .select("emailHash")
+      .where("invitationId", "=", created.id)
+      .where("expiresAt", ">", new Date())
+      .execute();
+    expect(renewed).toEqual([{ emailHash: digest(address).current }]);
+    await expect(gate({ email: address })).resolves.toBeUndefined();
+  });
+
+  it("stops recognising keyed reservations once AUTH_SECRET rotates", async () => {
+    const created = await invitation(1);
+    const address = `rotated-${randomUUID()}@example.test`;
+    await reserveInvitation(pool, digest(address), created.code);
+    await expect(
+      createRegistrationGate("invite", pool, digest)({ email: address }),
+    ).resolves.toBeUndefined();
+    const rotated = createEmailDigester(`${config.authSecret}-rotated`);
+    await expect(
+      createRegistrationGate("invite", pool, rotated)({ email: address }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      body: { code: "INVITATION_REQUIRED" },
     });
   });
 });

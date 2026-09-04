@@ -58,20 +58,51 @@ describe("seasonDurationMilliseconds", () => {
     expect(seasonDurationMilliseconds({ ticksPerSecond: 4, season: { durationTicks: 10 } })).toBe(
       2_500,
     );
+    // A large but exactly divisible product converts without floating-point rounding.
+    expect(
+      seasonDurationMilliseconds({
+        ticksPerSecond: 3,
+        season: { durationTicks: 27_021_597_764_202 },
+      }),
+    ).toBe(9_007_199_254_734_000);
   });
 
   it("rejects durations that would round when expressed in milliseconds", () => {
     expect(() =>
       seasonDurationMilliseconds({ ticksPerSecond: 3, season: { durationTicks: 10 } }),
     ).toThrow(/exactly representable/);
+  });
+
+  it("checks divisibility with integer arithmetic rather than a rounded floating-point quotient", () => {
+    // 27021597764204 * 1000 / 3 rounds to the safe integer 9007199254734667 in double precision,
+    // but the exact quotient is 9007199254734666 remainder 2.
+    expect(Number.isSafeInteger((27_021_597_764_204 * 1_000) / 3)).toBe(true);
+    expect(() =>
+      seasonDurationMilliseconds({
+        ticksPerSecond: 3,
+        season: { durationTicks: 27_021_597_764_204 },
+      }),
+    ).toThrow(/exactly representable/);
+  });
+
+  it("rejects non-positive, fractional, and unsafe inputs and results", () => {
     expect(() =>
       seasonDurationMilliseconds({ ticksPerSecond: 1, season: { durationTicks: 0 } }),
-    ).toThrow(/exactly representable/);
+    ).toThrow(/durationTicks must be a positive safe integer/);
+    expect(() =>
+      seasonDurationMilliseconds({ ticksPerSecond: 1, season: { durationTicks: 1.5 } }),
+    ).toThrow(/durationTicks must be a positive safe integer/);
+    expect(() =>
+      seasonDurationMilliseconds({ ticksPerSecond: 0, season: { durationTicks: 10 } }),
+    ).toThrow(/ticksPerSecond must be a positive safe integer/);
+    expect(() =>
+      seasonDurationMilliseconds({ ticksPerSecond: 2.5, season: { durationTicks: 10 } }),
+    ).toThrow(/ticksPerSecond must be a positive safe integer/);
     expect(() =>
       seasonDurationMilliseconds({
         ticksPerSecond: 1,
         season: { durationTicks: Number.MAX_SAFE_INTEGER },
       }),
-    ).toThrow(/exactly representable/);
+    ).toThrow(/exceeds the safe integer range/);
   });
 });
