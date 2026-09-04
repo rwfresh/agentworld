@@ -249,8 +249,8 @@ describe("concurrent mutations and transport guarantees", () => {
     });
     expect(invalidLimit.statusCode).toBe(400);
 
-    // Beta has earned Tier 1 through progress but nothing has persisted it yet; reading messages
-    // must pass the tier check without writing the promotion.
+    // Beta has earned Tier 1 through progress but nothing has persisted it yet; reading the inbox
+    // needs no tier and must stay side-effect free, so it must not write the promotion.
     await database
       .updateTable("players")
       .set({ successfulMutations: 5, completedStructures: 1 })

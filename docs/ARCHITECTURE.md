@@ -282,7 +282,9 @@ Events are an immutable audit and player-feed journal, not the source used to
 rebuild all current state. An event envelope includes:
 
 - UUIDv7 event ID and installation-local monotonically increasing offset;
-- world and emitting-server IDs, with optional actor-player and action IDs;
+- world and emitting-server IDs, with optional actor-player, target-player, and
+  action IDs (the target is the defender of a hostility or the owner of an
+  attacked structure, so their feed includes the event);
 - aggregate ID/type/version;
 - event type and payload schema version;
 - tick, UTC occurrence timestamp, ruleset hash, and visibility;
