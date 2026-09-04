@@ -4,9 +4,12 @@ import {
   assertValidRuleset,
   BETA_V1_RULESET,
   canAfford,
+  DEFAULT_ALLIANCE_RULES,
+  DEFAULT_TRADE_RULES,
   debitResources,
   inventoryTotal,
   playerId,
+  resolveRuleset,
   resourceAmount,
   resources,
   tick,
@@ -84,7 +87,52 @@ describe("beta-v1 ruleset", () => {
       maxHp: 180,
       influence: 25,
     });
+    expect(BETA_V1_RULESET.alliance).toEqual({ maxMembers: 20, inviteTtlTicks: 86_400 });
+    expect(BETA_V1_RULESET.trade).toEqual({ offerTtlTicks: 86_400 });
     expect(validateRuleset(BETA_V1_RULESET)).toEqual([]);
+  });
+});
+
+describe("optional ruleset sections", () => {
+  const withoutSocial = deletePath(deletePath(BETA_V1_RULESET, "alliance"), "trade");
+
+  it("accepts rulesets persisted before the alliance and trade sections existed", () => {
+    expect(validateRuleset(deletePath(BETA_V1_RULESET, "alliance"))).toEqual([]);
+    expect(validateRuleset(deletePath(BETA_V1_RULESET, "trade"))).toEqual([]);
+    expect(validateRuleset(withoutSocial)).toEqual([]);
+  });
+
+  it("resolves missing sections to defaults that reproduce beta-v1", () => {
+    const resolved = resolveRuleset(assertValidRuleset(withoutSocial));
+    expect(resolved.alliance).toBe(DEFAULT_ALLIANCE_RULES);
+    expect(resolved.trade).toBe(DEFAULT_TRADE_RULES);
+    expect(resolved).toEqual(BETA_V1_RULESET);
+  });
+
+  it("keeps explicit section values when resolving", () => {
+    const custom = assertValidRuleset(
+      setPath(setPath(BETA_V1_RULESET, "alliance.maxMembers", 5), "trade.offerTtlTicks", 60),
+    );
+    expect(resolveRuleset(custom)).toMatchObject({
+      alliance: { maxMembers: 5, inviteTtlTicks: 86_400 },
+      trade: { offerTtlTicks: 60 },
+    });
+    expect(resolveRuleset(BETA_V1_RULESET)).toEqual(BETA_V1_RULESET);
+  });
+
+  it("requires every field of a present section and rejects non-object sections", () => {
+    expect(validateRuleset(deletePath(BETA_V1_RULESET, "alliance.inviteTtlTicks"))).toEqual([
+      { path: "alliance.inviteTtlTicks", message: "is required" },
+    ]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "alliance", null))).toEqual([
+      { path: "alliance", message: "must be an object" },
+    ]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "trade", []))).toEqual([
+      { path: "trade", message: "must be an object" },
+    ]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "trade.offerTtlTicks", "86400"))).toEqual([
+      { path: "trade.offerTtlTicks", message: "must be a number" },
+    ]);
   });
 });
 
@@ -214,6 +262,11 @@ describe("ruleset value validation", () => {
     ["scoring.inferencePerPoint", 0],
     ["look.radius", 193],
     ["scan.radius", 500],
+    ["alliance.maxMembers", 0],
+    ["alliance.maxMembers", 2.5],
+    ["alliance.inviteTtlTicks", -1],
+    ["trade.offerTtlTicks", 0],
+    ["trade.offerTtlTicks", Number.MAX_SAFE_INTEGER + 1],
   ] as const)("rejects %s = %s", (path, value) => {
     expect(issuePaths(setPath(BETA_V1_RULESET, path, value))).toEqual([path]);
   });

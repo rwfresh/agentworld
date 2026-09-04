@@ -208,8 +208,16 @@ copied into immutable events or logs.
 ### Alliances
 
 Tier 1 players may create an alliance, invite a player, accept an invitation,
-leave, transfer leadership, or disband. An alliance has at most 20 members and
-one leader. A player belongs to at most one alliance per world.
+leave, transfer leadership, or disband. An alliance has one leader and at most
+`alliance.maxMembers` members (20 in `beta-v1`); the cap is checked when an
+invitation is issued and again when it is accepted. An invitation expires
+`alliance.inviteTtlTicks` after it is issued (86,400 ticks, 24 hours, in
+`beta-v1`) and can no longer be accepted. A player belongs to at most one
+alliance per world.
+
+The member cap and invitation window are read from the ruleset persisted with
+the world, never from server constants; a stored ruleset that predates these
+fields resolves to the `beta-v1` values.
 
 The leader must transfer leadership or disband before leaving. An alliance has
 no shared inventory, territory, technology, production, or automatic defense.
@@ -222,7 +230,8 @@ A Tier 2 player creates a recipient-specific offer containing offered and
 requested resource vectors. The offered transferable resources move into
 escrow in the creation transaction. Bound resources never enter escrow.
 
-- Offers expire 24 hours after creation.
+- Offers expire `trade.offerTtlTicks` after creation (86,400 ticks, 24 hours,
+  in `beta-v1`), read from the ruleset persisted with the world.
 - Only the named recipient may accept.
 - Both sides must remain eligible and the recipient must own all requested
   resources at acceptance.

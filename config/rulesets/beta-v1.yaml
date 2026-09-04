@@ -79,3 +79,5 @@ scoring:
   materialsPerPoint: 50
   inferencePerPoint: 25
 season: { durationTicks: 2419200, allianceFreezeTicks: 259200 }
+alliance: { maxMembers: 20, inviteTtlTicks: 86400 }
+trade: { offerTtlTicks: 86400 }

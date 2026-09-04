@@ -23,6 +23,18 @@ export interface StructureRule {
   readonly starterOnly?: boolean;
 }
 
+export interface AllianceRules {
+  /** Active members an alliance may hold, counting its leader. */
+  readonly maxMembers: number;
+  /** Ticks an invitation stays acceptable after it is issued. */
+  readonly inviteTtlTicks: number;
+}
+
+export interface TradeRules {
+  /** Ticks an offer stays open before it expires and its escrow is returned. */
+  readonly offerTtlTicks: number;
+}
+
 export interface Ruleset {
   readonly id: string;
   /** Pins map generation so an active world's ruleset hash also pins its terrain algorithm. */
@@ -99,7 +111,19 @@ export interface Ruleset {
     readonly durationTicks: number;
     readonly allianceFreezeTicks: number;
   };
+  /**
+   * Optional so rulesets persisted before these sections existed still validate; `resolveRuleset`
+   * fills in the defaults that reproduce the behaviour those worlds already had.
+   */
+  readonly alliance?: AllianceRules;
+  readonly trade?: TradeRules;
 }
+
+/** A `Ruleset` with every optional section present, so consumers read it without fallbacks. */
+export type ResolvedRuleset = Ruleset & {
+  readonly alliance: AllianceRules;
+  readonly trade: TradeRules;
+};
 
 export const BETA_V1_RULESET: Ruleset = {
   id: "beta-v1",
@@ -191,7 +215,25 @@ export const BETA_V1_RULESET: Ruleset = {
     inferencePerPoint: 25,
   },
   season: { durationTicks: 2_419_200, allianceFreezeTicks: 259_200 },
+  alliance: { maxMembers: 20, inviteTtlTicks: 86_400 },
+  trade: { offerTtlTicks: 86_400 },
 };
+
+/**
+ * The limits the server enforced before the ruleset carried them. Applying them to an older
+ * persisted ruleset leaves that world's behaviour exactly as it was.
+ */
+export const DEFAULT_ALLIANCE_RULES: AllianceRules = { maxMembers: 20, inviteTtlTicks: 86_400 };
+export const DEFAULT_TRADE_RULES: TradeRules = { offerTtlTicks: 86_400 };
+
+/** Fills each missing optional section with its default and leaves explicit values untouched. */
+export function resolveRuleset(ruleset: Ruleset): ResolvedRuleset {
+  return {
+    ...ruleset,
+    alliance: ruleset.alliance ?? DEFAULT_ALLIANCE_RULES,
+    trade: ruleset.trade ?? DEFAULT_TRADE_RULES,
+  };
+}
 
 export interface RulesetIssue {
   readonly path: string;
@@ -288,10 +330,21 @@ const NUMERIC_SECTIONS = {
   season: ["durationTicks", "allianceFreezeTicks"],
 } as const satisfies { readonly [K in NumericSection]: readonly (keyof Ruleset[K])[] };
 
+type OptionalNumericSection = "alliance" | "trade";
+
+/** Sections a ruleset may omit entirely; when one is present, every listed field must exist. */
+const OPTIONAL_NUMERIC_SECTIONS = {
+  alliance: ["maxMembers", "inviteTtlTicks"],
+  trade: ["offerTtlTicks"],
+} as const satisfies {
+  readonly [K in OptionalNumericSection]: readonly (keyof NonNullable<Ruleset[K]>)[];
+};
+
 /**
- * Verifies that `value` has the shape of a `Ruleset`: the root, every required section, and every
- * required primitive, with closed records for structures and terrain. It performs no arithmetic,
- * so malformed input yields precise issues instead of type errors.
+ * Verifies that `value` has the shape of a `Ruleset`: the root, every required section, every
+ * required primitive, and each optional section that is present, with closed records for
+ * structures and terrain. It performs no arithmetic, so malformed input yields precise issues
+ * instead of type errors.
  */
 function rulesetShapeIssues(value: unknown): readonly RulesetIssue[] {
   const issues: RulesetIssue[] = [];
@@ -363,6 +416,9 @@ function rulesetShapeIssues(value: unknown): readonly RulesetIssue[] {
   }
   for (const [section, fields] of Object.entries(NUMERIC_SECTIONS)) {
     numbers(section, root[section], fields);
+  }
+  for (const [section, fields] of Object.entries(OPTIONAL_NUMERIC_SECTIONS)) {
+    if (root[section] !== undefined) numbers(section, root[section], fields);
   }
   const movement = object("movement", root.movement);
   if (movement !== undefined) {
@@ -510,6 +566,13 @@ export function validateRuleset(value: unknown): readonly RulesetIssue[] {
   nonNegativeInteger("season.allianceFreezeTicks", ruleset.season.allianceFreezeTicks);
   if (ruleset.season.allianceFreezeTicks >= ruleset.season.durationTicks) {
     issues.push({ path: "season.allianceFreezeTicks", message: "must be shorter than the season" });
+  }
+  if (ruleset.alliance !== undefined) {
+    positiveInteger("alliance.maxMembers", ruleset.alliance.maxMembers);
+    positiveInteger("alliance.inviteTtlTicks", ruleset.alliance.inviteTtlTicks);
+  }
+  if (ruleset.trade !== undefined) {
+    positiveInteger("trade.offerTtlTicks", ruleset.trade.offerTtlTicks);
   }
   return issues;
 }

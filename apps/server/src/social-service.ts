@@ -9,6 +9,7 @@ import type {
   TradeView,
 } from "@agentworld/api-contract";
 import type { Database, Json } from "@agentworld/db";
+import { assertValidRuleset, type ResolvedRuleset, resolveRuleset } from "@agentworld/game-rules";
 import type { Transaction } from "kysely";
 import { sql } from "kysely";
 import { v7 as uuidv7 } from "uuid";
@@ -138,11 +139,26 @@ export class SocialService {
     return influence;
   }
 
+  /** Social limits come from the ruleset persisted with the world, never from server constants. */
+  private async worldRuleset(
+    transaction: Transaction<Database>,
+    worldId: string,
+  ): Promise<ResolvedRuleset> {
+    const world = await this.game.requireWorld(transaction, worldId);
+    return resolveRuleset(assertValidRuleset(world.ruleset));
+  }
+
+  /** Rounds a tick window up to whole milliseconds, as game-service does, so it never ends early. */
+  private expiryAfter(ticks: number, ruleset: ResolvedRuleset): Date {
+    return new Date(this.now().getTime() + Math.ceil((ticks * 1_000) / ruleset.ticksPerSecond));
+  }
+
   private async requireAllianceCapacity(
     transaction: Transaction<Database>,
     worldId: string,
     allianceId: string,
   ): Promise<void> {
+    const { alliance } = await this.worldRuleset(transaction, worldId);
     const count = await transaction
       .selectFrom("allianceMembers")
       .select((expression) => expression.fn.countAll().as("count"))
@@ -150,8 +166,12 @@ export class SocialService {
       .where("allianceId", "=", allianceId)
       .where("leftAt", "is", null)
       .executeTakeFirstOrThrow();
-    if (Number(count.count) >= 20) {
-      throw new HttpProblem(409, "ALLIANCE_FULL", "An alliance can have at most 20 members");
+    if (Number(count.count) >= alliance.maxMembers) {
+      throw new HttpProblem(
+        409,
+        "ALLIANCE_FULL",
+        `An alliance can have at most ${alliance.maxMembers} members`,
+      );
     }
   }
 
@@ -654,7 +674,8 @@ export class SocialService {
           })
           .where("playerId", "=", actor.id)
           .execute();
-        const expiresAt = new Date(this.now().getTime() + 86_400_000);
+        const ruleset = await this.worldRuleset(transaction, worldId);
+        const expiresAt = this.expiryAfter(ruleset.trade.offerTtlTicks, ruleset);
         const row = await transaction
           .insertInto("trades")
           .values({
@@ -957,6 +978,7 @@ export class SocialService {
             "Player already belongs to an alliance",
           );
         await this.requireAllianceCapacity(transaction, worldId, allianceId);
+        const ruleset = await this.worldRuleset(transaction, worldId);
         const invite = await transaction
           .insertInto("allianceInvites")
           .values({
@@ -966,7 +988,7 @@ export class SocialService {
             playerId: targetId,
             invitedByPlayerId: actor.id,
             state: "pending",
-            expiresAt: new Date(this.now().getTime() + 86_400_000),
+            expiresAt: this.expiryAfter(ruleset.alliance.inviteTtlTicks, ruleset),
           })
           .returning(["id", "expiresAt"])
           .executeTakeFirstOrThrow();
