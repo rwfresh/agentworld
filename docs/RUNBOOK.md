@@ -329,23 +329,51 @@ invite/device, and action-specific protections remain release work.
 
 The current worker handles due construction, trade expiry, and season
 finalization directly from authoritative PostgreSQL rows. Generalized
-retry/dead-letter metadata is not implemented.
+retry/dead-letter metadata is not implemented, but one bad row or job kind
+cannot wedge the others:
+
+- Every poll runs construction completion, trade expiry, season finalization,
+  and (after a finalization) next-season seeding inside separate failure
+  boundaries. A job kind that throws is logged as `<job> failed for this poll`
+  and the remaining kinds still run in the same poll. A failed seeding stays
+  pending and is retried on the next poll.
+- Construction completion and trade expiry process each due row in its own
+  transaction. A row that fails is logged as `<job> skipped row <id>` together
+  with the causal error, stays due, and is retried on a later poll while its
+  neighbours still complete. Logs carry job kinds, row ids, and database error
+  codes, never player-authored text.
+- A poll with any failed job kind or skipped row counts as a failing poll. The
+  poll interval (`WORKER_POLL_INTERVAL_MS`, default 1 s) doubles after each
+  consecutive failing poll up to 60 s (`Worker poll had ... next poll in N ms`)
+  and resets on the first clean poll. A persistent poison row therefore
+  degrades the worker to one attempt per minute instead of a one-second crash
+  loop; treat a steady stream of skipped-row lines as an incident.
+- Worker-written events (`CONSTRUCTION_COMPLETED`, `RESOURCES_PRODUCED`,
+  `SEASON_FINALIZED`) take their `aggregate_version` from the event journal
+  (`max(aggregate_version) + 1` under the aggregate's row lock), the same
+  allocator the API uses, so they cannot collide with API-written events under
+  `events_emitter_aggregate_version_unique`.
 
 1. Do not manually complete structures, resolve escrow, alter world state, or
    edit final rankings.
-2. Inspect worker logs, database locks, the oldest `constructing`
-   `completes_at`, open trade `expires_at`, and due active/finalizing world
-   `ends_at` values.
+2. Inspect worker logs for `failed for this poll`, `skipped row`, and backoff
+   lines, database locks, the oldest `constructing` `completes_at`, open trade
+   `expires_at`, and due active/finalizing world `ends_at` values. A skipped
+   row's id names the structure or trade to inspect.
 3. Stop the worker while preserving structure rows, then fix and deploy the
    causal code or data through an audited procedure.
 4. Restart one worker and verify each due item transitions once, ledgers/events
    agree with current state, player ranking counts match players, alliance
    ranking counts match eligible nonempty alliances, and a second pass makes
-   no duplicate change.
+   no duplicate change (grouping `events` by `emitting_server_id,
+   aggregate_type, aggregate_id, aggregate_version` yields no duplicates).
 5. Scale only after checking PostgreSQL connection and lock headroom.
 
-Email, maintenance, bounded retry, and dead-letter procedures must be added
-when those durable job types are implemented.
+Season finalization still claims one world per transaction; a world that fails
+to finalize is retried on every poll, with backoff, and blocks later due worlds
+of the same installation until fixed. Email, maintenance, bounded retry, and
+dead-letter procedures must be added when those durable job types are
+implemented.
 
 ### Economic exploit or invariant violation
 

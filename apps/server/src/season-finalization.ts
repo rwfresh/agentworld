@@ -26,9 +26,11 @@ import {
 import type { Kysely, Transaction } from "kysely";
 import { sql } from "kysely";
 
+import { nextAggregateVersion } from "./event-versions.ts";
+
 type ServerDatabase = Kysely<Database>;
 
-interface TradeResources {
+export interface TradeResources {
   readonly energy: number;
   readonly materials: number;
   readonly inference: number;
@@ -64,7 +66,11 @@ function deterministicId(kind: string, id: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-function parseTradeResources(value: Json): TradeResources {
+/**
+ * Parses a persisted escrow vector. Trades are player-authored rows, so a negative or
+ * non-integer component must fail closed instead of silently moving resources backwards.
+ */
+export function parseTradeResources(value: Json): TradeResources {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("trade has an invalid offered resource vector");
   }
@@ -88,7 +94,7 @@ function parseTradeResources(value: Json): TradeResources {
   };
 }
 
-function checkedAdd(left: number, right: number, label: string): number {
+export function checkedAdd(left: number, right: number, label: string): number {
   const result = left + right;
   if (!Number.isSafeInteger(result) || result < 0) {
     throw new RangeError(`${label} exceeds safe integer bounds`);
@@ -349,6 +355,8 @@ async function finalizeClaimedWorld(
       new Date(structure.completesAt).getTime() <= cutoffAt.getTime()
     ) {
       const completionAt = new Date(structure.completesAt);
+      // The row version is the structure's own optimistic counter; the event version comes from
+      // the event journal so it never collides with CONSTRUCTION_STARTED appended by the API.
       const nextVersion = structure.version + 1;
       await transaction
         .updateTable("structures")
@@ -379,7 +387,12 @@ async function finalizeClaimedWorld(
           type: "CONSTRUCTION_COMPLETED",
           aggregateType: "structure",
           aggregateId: structure.id,
-          aggregateVersion: nextVersion,
+          aggregateVersion: await nextAggregateVersion(
+            transaction,
+            world.homeServerId,
+            "structure",
+            structure.id,
+          ),
           tick: tickAt(startsAt, cutoffAt, completionAt, ruleset),
           rulesetHash: world.rulesetHash,
           payloadVersion: 1,
@@ -527,7 +540,12 @@ async function finalizeClaimedWorld(
           type: "RESOURCES_PRODUCED",
           aggregateType: "player",
           aggregateId: row.id,
-          aggregateVersion: 1,
+          aggregateVersion: await nextAggregateVersion(
+            transaction,
+            world.homeServerId,
+            "player",
+            row.id,
+          ),
           tick: finalTick,
           rulesetHash: world.rulesetHash,
           payloadVersion: 1,
@@ -730,7 +748,12 @@ async function finalizeClaimedWorld(
       type: "SEASON_FINALIZED",
       aggregateType: "world",
       aggregateId: world.id,
-      aggregateVersion: world.seasonNumber,
+      aggregateVersion: await nextAggregateVersion(
+        transaction,
+        world.homeServerId,
+        "world",
+        world.id,
+      ),
       tick: finalTick,
       rulesetHash: world.rulesetHash,
       payloadVersion: 1,

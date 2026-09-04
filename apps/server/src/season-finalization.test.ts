@@ -1,3 +1,4 @@
+import type { Json } from "@agentworld/db";
 import {
   BETA_V1_RULESET,
   coordinate,
@@ -12,7 +13,7 @@ import {
 } from "@agentworld/game-rules";
 import { describe, expect, it } from "vitest";
 
-import { settleProductionThroughTick } from "./season-finalization.ts";
+import { parseTradeResources, settleProductionThroughTick } from "./season-finalization.ts";
 
 describe("settleProductionThroughTick", () => {
   it("settles every capped chunk through cutoff without discarding old production", () => {
@@ -116,4 +117,29 @@ describe("settleProductionThroughTick", () => {
       /beyond the season cutoff/,
     );
   });
+});
+
+describe("parseTradeResources", () => {
+  it("accepts a nonnegative safe-integer vector", () => {
+    expect(parseTradeResources({ energy: 5, materials: 0, inference: 2 })).toEqual({
+      energy: 5,
+      materials: 0,
+      inference: 2,
+    });
+  });
+
+  const rejected: ReadonlyArray<readonly [string, Json]> = [
+    ["a negative component", { energy: -5, materials: 0, inference: 0 }],
+    ["a fractional component", { energy: 1.5, materials: 0, inference: 0 }],
+    ["an unsafe integer", { energy: Number.MAX_SAFE_INTEGER + 1, materials: 0, inference: 0 }],
+    ["a missing component", { energy: 1, materials: 0 }],
+    ["a string component", { energy: "5", materials: 0, inference: 0 }],
+    ["an array", [5, 0, 0]],
+    ["null", null],
+  ];
+  for (const [label, value] of rejected) {
+    it(`rejects ${label}`, () => {
+      expect(() => parseTradeResources(value)).toThrow(/invalid offered resource vector/);
+    });
+  }
 });
