@@ -164,7 +164,7 @@ required beta lifecycle is:
 9. Load the snapshot and invoke the pure rules decision. Today `loadGame` reads
    the whole world: every player, inventory, structure, hostility, cooldown,
    and combat award window. Narrowing it to what the decision needs is a
-   tracked follow-up; until then the transaction shape below is what keeps
+   tracked follow-up (issue #2); until then the transaction shape below is what keeps
    concurrent play correct.
 10. Apply effects, resource-ledger entries, aggregate versions, and discovery,
     writing only rows whose state changed. Players, inventories, and
@@ -212,11 +212,13 @@ operator-held secret and public season identifiers, then persisted but never
 exposed through the API; changing Node.js, process count, or call order must not
 change the generated map. Combat has no RNG in beta.
 
-Production is lazy. Each producer has a settlement cursor; elapsed complete
-intervals are credited once, bounded by the offline cap. Reads can project the
-same formula without advancing the cursor. At cutoff, the worker repeatedly
-applies the capped pure settlement rule until every producer reaches the exact
-final tick, so the per-settlement cap never discards older production.
+Production is lazy. Each producer has a settlement cursor. One settlement
+advances the cursor by at most one offline-cap chunk (24 hours for `beta-v1`)
+and credits the complete intervals inside it; ticks beyond the chunk stay ahead
+of the cursor for the next settlement, so nothing is discarded in season. Reads
+project one chunk with the same formula without advancing the cursor. At
+cutoff, the worker repeatedly applies the same rule until every producer
+reaches the exact final tick, so in-season and final settlement agree.
 
 ## Persistence model
 
@@ -309,7 +311,7 @@ database constraints remain the last defense.
 - Because the mutation snapshot is still whole-world, any two concurrent
   mutations in one world can form a read/write dependency cycle under SSI even
   when they touch different players. The retry makes this recoverable; the
-  snapshot follow-up is what will make it rare. `persistDecision` writes only
+  snapshot follow-up (issue #2) is what will make it rare. `persistDecision` writes only
   changed rows (players, inventories, structures, and hostilities are diffed
   against the loaded snapshot) so that write amplification does not widen the
   conflict footprint further.

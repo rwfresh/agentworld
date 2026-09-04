@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createDatabase } from "@agentworld/db";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "kysely";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../../apps/server/src/app.ts";
 import { createAuthRuntime } from "../../apps/server/src/auth.ts";
 import { type AppConfig, readConfig } from "../../apps/server/src/config.ts";

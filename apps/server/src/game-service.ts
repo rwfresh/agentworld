@@ -52,6 +52,7 @@ import type { Kysely, Transaction } from "kysely";
 import { sql } from "kysely";
 import { v7 as uuidv7 } from "uuid";
 import type { AppConfig } from "./config.ts";
+import { nextAggregateVersion } from "./event-versions.ts";
 import { HttpProblem } from "./problem.ts";
 import { runSerializable } from "./transaction.ts";
 
@@ -120,24 +121,6 @@ function json(value: unknown): Json {
 
 function untrusted(content: string) {
   return { content, trust: "untrusted_player_input" as const };
-}
-
-async function nextAggregateVersion(
-  transaction: Transaction<Database>,
-  emittingServerId: string,
-  aggregateType: string,
-  aggregateId: string,
-): Promise<number> {
-  const row = await transaction
-    .selectFrom("events")
-    .select(({ fn }) => fn.max("aggregateVersion").as("version"))
-    .where("emittingServerId", "=", emittingServerId)
-    .where("aggregateType", "=", aggregateType)
-    .where("aggregateId", "=", aggregateId)
-    .executeTakeFirstOrThrow();
-  const version = Number(row.version ?? 0) + 1;
-  if (!Number.isSafeInteger(version)) throw new RangeError("event aggregate version overflow");
-  return version;
 }
 
 type TickRate = Pick<Ruleset, "ticksPerSecond">;

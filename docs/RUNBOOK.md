@@ -91,6 +91,8 @@ on an absent or unsafe required value.
 | `RULESET_PATH` | yes | Immutable checked-in beta ruleset path |
 | `GITHUB_CLIENT_ID/SECRET` | provider-dependent | OAuth app with exact production callback |
 | `SMTP_URL` / `EMAIL_FROM` | email-dependent | Transactional provider URL and verified sender |
+| `WORKER_POLL_INTERVAL_MS` | optional | Worker poll interval in milliseconds; default 1000, also the floor of the failure backoff |
+| `WORKER_BATCH_SIZE` | optional | Maximum due rows the worker claims per job kind per poll; default 100 |
 
 Do not store secrets in `.env.example`, Compose, the Render Blueprint, logs, or
 the repository. `BASE_URL`, OAuth callbacks, cookie security, proxy trust, and

@@ -126,7 +126,11 @@ normalized, checked by hash, bounded by its expiry and maximum-use count, and
 reserved to the normalized email before the link is sent. `closed` registration
 rejects all new accounts. Unknown emails receive the same outward magic-link
 acknowledgement whether registration is closed or an invite is invalid, which
-prevents using the endpoint as an account-enumeration oracle.
+prevents using the endpoint as an account-enumeration oracle. When an account
+creation is refused at sign-in completion (a GitHub or magic-link callback
+without a valid reservation), the portal receives `error=INVITATION_REQUIRED`
+or `error=REGISTRATION_CLOSED` on the `errorCallbackURL` it supplied and shows
+the corresponding guidance.
 
 ## Resources and routes
 
@@ -171,7 +175,9 @@ the name wrap it as untrusted content.
 `look` does not mutate discovery. If persistent discovery is required by the
 rules implementation, the client uses the scan/action route; GET requests are
 always safe and idempotent. Reads project passive production at one captured
-tick but do not advance a settlement cursor.
+tick but do not advance a settlement cursor. A projection covers at most one
+24-hour settlement chunk, so after a long absence `status` under-reports until
+later mutations settle the remaining chunks.
 
 Map queries accept `cursor` and `limit`. Coordinate-window filters are not yet
 implemented. The server never reveals current state on undiscovered/non-visible
@@ -342,7 +348,10 @@ live in `packages/api-contract` and type the API client's
 | `DELETE` | `/v1/worlds/{worldId}/relationships/{playerId}/hostility` | `combat:write` | Withdraw hostility |
 
 Bodies are `{}`. The returned receipt states the effective tick and derived
-attack/retaliation window without exposing hidden opponent state.
+attack/retaliation window without exposing hidden opponent state. Re-declaring
+hostility against a player you withdrew from returns `409 COOLDOWN_ACTIVE` with
+`retryAfter` until both the original warmup and their retaliation window have
+elapsed, so withdrawal cannot be used to reset the ordering of declarations.
 
 ## Pagination
 

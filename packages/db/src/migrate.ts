@@ -1,8 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { FileMigrationProvider, Migrator } from "kysely/migration";
 import type { Kysely } from "kysely";
+import { FileMigrationProvider, Migrator } from "kysely/migration";
 import type { Database } from "./schema.ts";
 
 export async function migrateToLatest(db: Kysely<Database>): Promise<void> {

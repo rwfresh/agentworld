@@ -228,6 +228,11 @@ automation at abusive rates, denial of fair access.
   hosted beta, mutation cooldowns, and per-route/account/network rate limits.
 - Recipient acceptance and escrow for gifts/trades; resource-ledger analysis
   across related accounts; configurable trade/combat kill switches.
+- Building is confined to the actor's own starter plot inside the reserve and to
+  contested/frontier tiles outside it, so unallocated plots cannot be poisoned
+  before their owner spawns and the unattackable reserve cannot farm structure
+  influence. Re-declaring hostility right after withdrawing is blocked until the
+  original warmup and the defender's retaliation window have both elapsed.
 - No combat in starter plots; no loot/capture; zero combat reward against a
   sufficiently weaker player; per-opponent rolling reward cap.
 - Alliance membership cap and 72-hour pre-cutoff membership freeze.
