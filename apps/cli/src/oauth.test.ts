@@ -65,6 +65,9 @@ describe("OAuth token lifecycle", () => {
       expiresAt: "2026-09-02T12:10:00.000Z",
       scope: "world:read offline_access",
     });
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+    }
   });
 
   it("uses the advertised revocation endpoint and prefers the refresh token", async () => {
@@ -79,6 +82,7 @@ describe("OAuth token lifecycle", () => {
         );
       }
       expect(url).toBe("https://auth.example.test/oauth2/revoke");
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
       const body = new URLSearchParams(String(init?.body));
       expect(body.get("token")).toBe("refresh-secret");
       expect(body.get("token_type_hint")).toBe("refresh_token");
@@ -109,5 +113,67 @@ describe("OAuth token lifecycle", () => {
         fetchImplementation: fetchMock,
       }),
     ).rejects.toMatchObject({ problem: { code: "token_endpoint_unavailable" } });
+  });
+
+  it("reports a token endpoint that exceeds the deadline as a retryable timeout", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/.well-known/agentworld")) {
+        return new Response(
+          JSON.stringify({
+            token_endpoint: "https://play.example.test/api/auth/oauth2/token",
+            revocation_endpoint: "https://play.example.test/api/auth/oauth2/revoke",
+          }),
+        );
+      }
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    });
+    const credentials = { accessToken: "old", refreshToken: "refresh" };
+
+    await expect(
+      refreshCredentials({
+        server: "https://play.example.test",
+        credentials,
+        fetchImplementation: fetchMock,
+        timeoutMs: 750,
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 6,
+      problem: {
+        title: "Could not reach the authorization server",
+        code: "request_timeout",
+        detail: "No response within 750 ms.",
+        retryable: true,
+      },
+    });
+    await expect(
+      revokeCredentials({
+        server: "https://play.example.test",
+        credentials,
+        fetchImplementation: fetchMock,
+        timeoutMs: 750,
+      }),
+    ).resolves.toBe("failed");
+  });
+
+  it("keeps the authorization network error code for non-deadline transport failures", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/.well-known/agentworld")) {
+        return new Response(
+          JSON.stringify({ token_endpoint: "https://play.example.test/api/auth/oauth2/token" }),
+        );
+      }
+      throw new TypeError("offline");
+    });
+
+    await expect(
+      refreshCredentials({
+        server: "https://play.example.test",
+        credentials: { accessToken: "old", refreshToken: "refresh" },
+        fetchImplementation: fetchMock,
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 6,
+      problem: { code: "authorization_network_error", detail: "offline", retryable: true },
+    });
   });
 });

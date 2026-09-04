@@ -190,6 +190,11 @@ and `west`. Resource names are `energy`, `materials`, and `inference`. The
 `hills`, and `wetlands`, and zone values `safe`, `contested`, and `frontier` on
 the wire (`safe` corresponds to the domain's starter zone).
 
+`bonusInference` is an optional non-negative safe integer. The wire contract
+does not fix its ceiling: the active ruleset (`combat.maxBonusInference`, `10`
+in `beta-v1`) decides how much extra Inference an attack may spend and rejects
+anything above it with `INVALID_BONUS`.
+
 Successful mutations return an action receipt:
 
 ```json
@@ -299,6 +304,31 @@ keys. Trade states are `open`, `accepted`, `cancelled`, and `expired`.
 Create body is `{ "name": "Northern Accord" }`. Alliance and member names are
 returned as untrusted player text.
 
+Accepting an invitation returns an `AllianceInviteAcceptResponse`:
+
+```json
+{ "accepted": true, "allianceId": "0198a640-4a1b-7c6e-9d3f-2b7e6c1a9f10" }
+```
+
+Leaving, transferring leadership, and disbanding return an
+`AllianceAdministrationResponse`. `operation` is `leave`, `leadership`, or
+`disband`; `playerId` appears only on leadership transfers and names the new
+leader:
+
+```json
+{
+  "ok": true,
+  "operation": "leadership",
+  "allianceId": "0198a640-4a1b-7c6e-9d3f-2b7e6c1a9f10",
+  "playerId": "0198a624-0f49-7fc0-b53d-624f209a6fee"
+}
+```
+
+Accept and leave bodies are `{}`; disband sends no body. Both response schemas
+live in `packages/api-contract` and type the API client's
+`acceptAllianceInvite`, `leaveAlliance`, `transferAllianceLeadership`, and
+`disbandAlliance` methods.
+
 ### Hostility
 
 | Method | Route | Scope | Purpose |
@@ -405,14 +435,22 @@ agentworld events
 agentworld move <north|east|south|west>
 agentworld build <generator|extractor|compute_node|defense_node>
 agentworld harvest [energy|materials|inference]
-agentworld message ...
+agentworld message list|send ...
 agentworld moderation block|unblock|mute|unmute|report ...
-agentworld trade ...
-agentworld alliance ...
-agentworld hostility ...
-agentworld attack ...
+agentworld trade list|create|accept|cancel ...
+agentworld alliance list|create|invite|accept|leave|leadership|disband ...
+agentworld hostility declare|withdraw <player-id>
+agentworld attack <structure-id> [--inference <amount>]
 agentworld leaderboard
 ```
+
+`look` is a pure read. `scan` is the inference-powered mutation; there is no
+`look --scan` alias, so a read-sounding command never spends resources. Every
+command is issued through `@agentworld/api-client`, whose request and response
+types come from `packages/api-contract`; the CLI assembles no paths or bodies
+by hand and only validates enumerations (`direction`, `structure`, `resource`)
+locally before sending. `build` also accepts the hyphenated spellings
+`compute-node` and `defense-node`.
 
 Every game command accepts `--json`. In JSON mode, stdout contains one stable
 JSON value and a trailing newline; progress and diagnostics go only to stderr.
@@ -431,8 +469,13 @@ Exit codes:
 | 5 | Rate limited; use returned retry information |
 | 6 | Network, dependency, or server failure |
 
-The CLI makes at most two bounded transport attempts. It proactively refreshes
-expiring sessions and retries one authenticated `401`; mutation retries retain
-the original idempotency key. After both attempts fail ambiguously, inspect
-state before issuing a new command because a new CLI invocation generates a new
-key.
+The CLI makes at most two bounded transport attempts. Each attempt, including
+device-login, token-refresh, and revocation requests, carries its own deadline
+of 30 seconds; `AGENTWORLD_TIMEOUT_MS` overrides it with a whole number of
+milliseconds from `1` to `2147483647` and is validated once at startup (exit
+code 2 when malformed). An attempt that exceeds the deadline is retried once
+and then fails with exit code 6 and `request_timeout`. The CLI proactively
+refreshes expiring sessions and retries one authenticated `401`; mutation
+retries retain the original idempotency key. After both attempts fail
+ambiguously, inspect state before issuing a new command because a new CLI
+invocation generates a new key.

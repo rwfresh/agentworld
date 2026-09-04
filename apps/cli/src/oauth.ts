@@ -1,9 +1,15 @@
 import type { StoredCredentials } from "./config.ts";
 import { CliError, ExitCode } from "./errors.ts";
-import type { FetchImplementation } from "./http.ts";
+import {
+  defaultTimeoutMs,
+  type FetchImplementation,
+  transportFailure,
+  withTimeout,
+} from "./http.ts";
 
 const clientId = "agentworld-cli";
 const refreshLeewayMilliseconds = 30_000;
+const authorizationServerTitle = "Could not reach the authorization server";
 
 interface AgentWorldDiscovery {
   readonly authIssuer?: string;
@@ -26,12 +32,16 @@ export interface RefreshCredentialsOptions {
   readonly credentials: StoredCredentials;
   readonly fetchImplementation?: FetchImplementation;
   readonly now?: () => number;
+  /** Per-request deadline in milliseconds; defaults to 30 seconds. */
+  readonly timeoutMs?: number;
 }
 
 export interface RevokeCredentialsOptions {
   readonly server: string;
   readonly credentials: StoredCredentials;
   readonly fetchImplementation?: FetchImplementation;
+  /** Per-request deadline in milliseconds; defaults to 30 seconds. */
+  readonly timeoutMs?: number;
 }
 
 export type RevocationResult = "revoked" | "unavailable" | "failed";
@@ -40,12 +50,10 @@ function authError(title: string, detail: string, code: string): CliError {
   return new CliError(ExitCode.auth, { title, detail, code, retryable: false });
 }
 
-function networkError(error: unknown): CliError {
-  return new CliError(ExitCode.network, {
-    title: "Could not reach the authorization server",
-    detail: error instanceof Error ? error.message : "The authorization request failed.",
+function networkError(error: unknown, timeoutMs: number): CliError {
+  return transportFailure(error, timeoutMs, {
+    title: authorizationServerTitle,
     code: "authorization_network_error",
-    retryable: true,
   });
 }
 
@@ -156,7 +164,11 @@ export async function refreshCredentials(
       "refresh_token_missing",
     );
   }
-  const fetchImplementation = options.fetchImplementation ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+  const fetchImplementation = withTimeout(
+    options.fetchImplementation ?? globalThis.fetch,
+    timeoutMs,
+  );
   const endpoints = await discoverOAuthEndpoints(options.server, fetchImplementation, "token");
   if (!endpoints.tokenEndpoint) {
     throw authError(
@@ -180,7 +192,7 @@ export async function refreshCredentials(
       redirect: "error",
     });
   } catch (error) {
-    throw networkError(error);
+    throw networkError(error, timeoutMs);
   }
   const body = await decodeObject(response);
   if (!response.ok) {
@@ -240,7 +252,10 @@ export async function revokeCredentials(
 ): Promise<RevocationResult> {
   const token = options.credentials.refreshToken ?? options.credentials.accessToken;
   if (!token) return "unavailable";
-  const fetchImplementation = options.fetchImplementation ?? globalThis.fetch;
+  const fetchImplementation = withTimeout(
+    options.fetchImplementation ?? globalThis.fetch,
+    options.timeoutMs ?? defaultTimeoutMs,
+  );
   try {
     const endpoints = await discoverOAuthEndpoints(
       options.server,

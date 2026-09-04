@@ -1,6 +1,21 @@
 import { spawn } from "node:child_process";
 import { CliError, ExitCode } from "./errors.ts";
-import type { FetchImplementation } from "./http.ts";
+import {
+  defaultTimeoutMs,
+  type FetchImplementation,
+  transportFailure,
+  withTimeout,
+} from "./http.ts";
+
+const defaultExpiresInSeconds = 600;
+const defaultIntervalSeconds = 5;
+/**
+ * RFC 8628 leaves device timing unbounded. These bounds keep a hostile or buggy
+ * server from making the CLI poll rapidly (a delay above 2^31-1 ms collapses to
+ * 1 ms in Node timers) or wait forever for a code that never expires.
+ */
+const intervalSecondsRange = { minimum: 1, maximum: 60 } as const;
+const expiresInSecondsRange = { minimum: 30, maximum: 1_800 } as const;
 
 export interface DeviceAuthorization {
   readonly deviceCode: string;
@@ -36,7 +51,11 @@ export interface DeviceFlowOptions {
   readonly notify?: (message: string) => void;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly now?: () => number;
+  /** Per-request deadline in milliseconds; defaults to 30 seconds. */
+  readonly timeoutMs?: number;
 }
+
+const authorizationServerTitle = "Could not reach the authorization server";
 
 function authError(title: string, detail: string, code: string): CliError {
   return new CliError(ExitCode.auth, { title, detail, code, retryable: false });
@@ -88,6 +107,20 @@ function requiredString(input: Record<string, unknown>, snake: string, camel: st
   return value;
 }
 
+/** Only finite, safe, positive integers are trusted; valid values are clamped into the range. */
+function boundedSeconds(
+  value: unknown,
+  range: { readonly minimum: number; readonly maximum: number },
+  fallback: number,
+): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return fallback;
+  return Math.min(Math.max(value, range.minimum), range.maximum);
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 export function parseDeviceAuthorization(input: Record<string, unknown>): DeviceAuthorization {
   const complete = input.verification_uri_complete ?? input.verificationUriComplete;
   const expires = input.expires_in ?? input.expiresIn;
@@ -97,8 +130,8 @@ export function parseDeviceAuthorization(input: Record<string, unknown>): Device
     userCode: requiredString(input, "user_code", "userCode"),
     verificationUri: requiredString(input, "verification_uri", "verificationUri"),
     ...(typeof complete === "string" ? { verificationUriComplete: complete } : {}),
-    expiresIn: typeof expires === "number" && expires > 0 ? expires : 600,
-    interval: typeof interval === "number" && interval > 0 ? interval : 5,
+    expiresIn: boundedSeconds(expires, expiresInSecondsRange, defaultExpiresInSeconds),
+    interval: boundedSeconds(interval, intervalSecondsRange, defaultIntervalSeconds),
   };
 }
 
@@ -125,7 +158,11 @@ export async function openSystemBrowser(url: string): Promise<void> {
 }
 
 export async function loginWithDevice(options: DeviceFlowOptions): Promise<TokenSet> {
-  const fetchImplementation = options.fetchImplementation ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+  const fetchImplementation = withTimeout(
+    options.fetchImplementation ?? globalThis.fetch,
+    timeoutMs,
+  );
   const sleep =
     options.sleep ??
     ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
@@ -162,11 +199,16 @@ export async function loginWithDevice(options: DeviceFlowOptions): Promise<Token
     scope: requestedScopes.join(" "),
     resource: server,
   });
-  const deviceResponse = await fetchImplementation(deviceEndpoint, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-    body: requestBody,
-  });
+  let deviceResponse: Response;
+  try {
+    deviceResponse = await fetchImplementation(deviceEndpoint, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+      body: requestBody,
+    });
+  } catch (error) {
+    throw transportFailure(error, timeoutMs, { title: authorizationServerTitle });
+  }
   const deviceBody = await decodeJson(deviceResponse);
   if (!deviceResponse.ok) {
     throw authError(
@@ -189,24 +231,32 @@ export async function loginWithDevice(options: DeviceFlowOptions): Promise<Token
   let interval = authorization.interval;
   while (now() < deadline) {
     await sleep(interval * 1_000);
-    const response = await fetchImplementation(tokenEndpoint, {
-      method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-        device_code: authorization.deviceCode,
-        client_id: "agentworld-cli",
-        resource: server,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetchImplementation(tokenEndpoint, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: authorization.deviceCode,
+          client_id: "agentworld-cli",
+          resource: server,
+        }),
+      });
+    } catch (error) {
+      throw transportFailure(error, timeoutMs, { title: authorizationServerTitle });
+    }
     const body = await decodeJson(response);
     if (response.ok) {
-      const expiresIn = body.expires_in ?? body.expiresIn;
+      const expiresIn = positiveSafeInteger(body.expires_in ?? body.expiresIn);
       const refreshToken = body.refresh_token ?? body.refreshToken;
       return {
         accessToken: requiredString(body, "access_token", "accessToken"),
         ...(typeof refreshToken === "string" ? { refreshToken } : {}),
-        ...(typeof expiresIn === "number" ? { expiresIn } : {}),
+        ...(expiresIn === undefined ? {} : { expiresIn }),
         ...(typeof body.scope === "string" ? { scope: body.scope } : {}),
       };
     }
@@ -214,7 +264,7 @@ export async function loginWithDevice(options: DeviceFlowOptions): Promise<Token
     const error = body.error;
     if (error === "authorization_pending") continue;
     if (error === "slow_down") {
-      interval += 5;
+      interval = Math.min(interval + 5, intervalSecondsRange.maximum);
       continue;
     }
     if (error === "access_denied") {

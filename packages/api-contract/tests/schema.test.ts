@@ -1,6 +1,10 @@
+import { Value } from "@sinclair/typebox/value";
 import { describe, expect, it } from "vitest";
 import {
+  AllianceAdministrationResponse,
+  AllianceInviteAcceptResponse,
   AllianceInviteResponse,
+  AttackRequest,
   InstallationDiscovery,
   InventoryResponse,
   LeaderboardResponse,
@@ -53,6 +57,40 @@ describe("public game schemas", () => {
 
   it("types alliance invitation receipts", () => {
     expect(AllianceInviteResponse.required).toEqual(["inviteId", "expiresAt"]);
+  });
+
+  it("types alliance invitation acceptance receipts", () => {
+    expect(AllianceInviteAcceptResponse.required).toEqual(["accepted", "allianceId"]);
+    expect(AllianceInviteAcceptResponse.properties.accepted).toMatchObject({ const: true });
+    expect(AllianceInviteAcceptResponse.additionalProperties).toBe(false);
+  });
+
+  it("types alliance administration receipts", () => {
+    expect(AllianceAdministrationResponse.required).toEqual(["ok", "operation", "allianceId"]);
+    expect(AllianceAdministrationResponse.required).not.toContain("playerId");
+    expect(AllianceAdministrationResponse.properties.ok).toMatchObject({ const: true });
+    expect(literalValues(AllianceAdministrationResponse.properties.operation)).toEqual([
+      "leave",
+      "leadership",
+      "disband",
+    ]);
+    expect(Value.Check(AllianceAdministrationResponse.properties.operation, "merge")).toBe(false);
+  });
+
+  it("leaves the attack bonus ceiling to the ruleset", () => {
+    const bonus = AttackRequest.properties.bonusInference;
+    expect(AttackRequest.required).toEqual(["targetStructureId"]);
+    expect(bonus).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+    });
+    expect(Value.Check(bonus, 0)).toBe(true);
+    expect(Value.Check(bonus, 11)).toBe(true);
+    expect(Value.Check(bonus, Number.MAX_SAFE_INTEGER)).toBe(true);
+    for (const rejected of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, "4"]) {
+      expect(Value.Check(bonus, rejected)).toBe(false);
+    }
   });
 
   it("advertises the endpoints required by OAuth device clients", () => {

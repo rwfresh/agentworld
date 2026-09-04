@@ -13,6 +13,11 @@ agentworld look --json
 
 Set `AGENTWORLD_CONFIG_DIR` to isolate profiles during development or automation. A short-lived
 access token may be supplied through `AGENTWORLD_TOKEN`; it is never copied into the profile file.
+Every outbound request has a 30 second per-attempt deadline; `AGENTWORLD_TIMEOUT_MS` overrides it
+with a whole number of milliseconds.
+
+The CLI is a thin front end for `@agentworld/api-client`: every path, body, and response is typed
+by `@agentworld/api-contract`, and the server remains the only authority on game rules.
 
 Stored credentials are bound to their normalized server origin. Remote servers must use HTTPS;
 HTTP is accepted only for loopback development. The CLI refreshes expiring access tokens, performs

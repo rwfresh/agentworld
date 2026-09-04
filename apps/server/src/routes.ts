@@ -1,6 +1,8 @@
 import {
   ActionReceipt,
+  AllianceAdministrationResponse,
   AllianceCreateRequest,
+  AllianceInviteAcceptResponse,
   AllianceInviteRequest,
   AllianceInviteResponse,
   AllianceListResponse,
@@ -541,7 +543,12 @@ export async function registerGameRoutes(
     "/v1/worlds/:worldId/alliance-invites/:inviteId/accept",
     {
       preHandler: auth(authRuntime, "social:write"),
-      schema: { params: InviteParams, body: EmptyBody, tags: ["alliances"] },
+      schema: {
+        params: InviteParams,
+        body: EmptyBody,
+        response: { 200: AllianceInviteAcceptResponse },
+        tags: ["alliances"],
+      },
     },
     (request) =>
       social.acceptAllianceInvite(
@@ -555,7 +562,12 @@ export async function registerGameRoutes(
     "/v1/worlds/:worldId/alliances/:allianceId/leave",
     {
       preHandler: auth(authRuntime, "social:write"),
-      schema: { params: AllianceParams, body: EmptyBody, tags: ["alliances"] },
+      schema: {
+        params: AllianceParams,
+        body: EmptyBody,
+        response: { 200: AllianceAdministrationResponse },
+        tags: ["alliances"],
+      },
     },
     (request) =>
       social.allianceAdministration(
@@ -570,7 +582,12 @@ export async function registerGameRoutes(
     "/v1/worlds/:worldId/alliances/:allianceId/leadership",
     {
       preHandler: auth(authRuntime, "social:write"),
-      schema: { params: AllianceParams, body: LeadershipRequest, tags: ["alliances"] },
+      schema: {
+        params: AllianceParams,
+        body: LeadershipRequest,
+        response: { 200: AllianceAdministrationResponse },
+        tags: ["alliances"],
+      },
     },
     (request) =>
       social.allianceAdministration(
@@ -586,7 +603,11 @@ export async function registerGameRoutes(
     "/v1/worlds/:worldId/alliances/:allianceId",
     {
       preHandler: auth(authRuntime, "social:write"),
-      schema: { params: AllianceParams, tags: ["alliances"] },
+      schema: {
+        params: AllianceParams,
+        response: { 200: AllianceAdministrationResponse },
+        tags: ["alliances"],
+      },
     },
     (request) =>
       social.allianceAdministration(

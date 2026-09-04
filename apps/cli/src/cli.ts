@@ -1,4 +1,21 @@
 import { randomUUID } from "node:crypto";
+import { AgentWorldClient } from "@agentworld/api-client";
+import type {
+  AllianceCreateRequest,
+  AllianceInviteRequest,
+  AttackRequest,
+  BuildRequest,
+  Direction,
+  HarvestRequest,
+  MoveRequest,
+  ReportRequest,
+  ResourceKind,
+  Resources,
+  SendMessageRequest,
+  SpawnRequest,
+  StructureKind,
+  TradeOfferRequest,
+} from "@agentworld/api-contract";
 import { Command, InvalidArgumentError } from "commander";
 import {
   ConfigStore,
@@ -9,7 +26,7 @@ import {
 } from "./config.ts";
 import { loginWithDevice, openSystemBrowser } from "./device-flow.ts";
 import { CliError, ExitCode, toCliError } from "./errors.ts";
-import { AgentWorldHttpClient, type FetchImplementation } from "./http.ts";
+import { callApi, type FetchImplementation, requestTimeoutMs } from "./http.ts";
 import { refreshCredentials, revokeCredentials, shouldRefreshCredentials } from "./oauth.ts";
 import {
   type OutputWriter,
@@ -18,6 +35,8 @@ import {
   stableJson,
   writeResult,
 } from "./terminal.ts";
+
+const cliVersion = "0.1.0";
 
 interface GlobalOptions {
   readonly json: boolean;
@@ -32,17 +51,18 @@ interface Runtime {
   readonly fetchImplementation: FetchImplementation;
   readonly writer: OutputWriter;
   readonly openBrowser: (url: string) => Promise<void>;
+  /** Per-attempt deadline applied to every outbound request. */
+  readonly timeoutMs: number;
 }
 
 interface RequestContext {
-  readonly client: AgentWorldHttpClient;
-  readonly profileName: string;
-  readonly profile: Profile;
+  readonly client: AgentWorldClient;
   readonly world?: string;
-  readonly refreshClient?: () => Promise<AgentWorldHttpClient>;
+  readonly refreshClient?: () => Promise<AgentWorldClient>;
 }
 
-type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+/** One user-intended call against the selected world, keyed once so retries replay it. */
+type WorldOperation<T> = (client: AgentWorldClient, world: string, key: string) => Promise<T>;
 
 const offlineScope = "offline_access";
 const allScopes = [
@@ -53,6 +73,37 @@ const allScopes = [
   "combat:write",
   offlineScope,
 ];
+
+const directions = { north: true, east: true, south: true, west: true } satisfies Record<
+  Direction,
+  true
+>;
+const resourceKinds = { energy: true, materials: true, inference: true } satisfies Record<
+  ResourceKind,
+  true
+>;
+/** Accepted spellings for every wire structure kind; hyphenated forms are a CLI convenience. */
+const structureSpellings = {
+  command_node: ["command_node", "command-node"],
+  generator: ["generator"],
+  extractor: ["extractor"],
+  compute_node: ["compute_node", "compute-node"],
+  defense_node: ["defense_node", "defense-node"],
+} satisfies Record<StructureKind, readonly string[]>;
+
+function isMember<T extends string>(table: Readonly<Record<T, true>>, value: string): value is T {
+  return Object.hasOwn(table, value);
+}
+
+function kindForSpelling<T extends string>(
+  table: Readonly<Record<T, readonly string[]>>,
+  value: string,
+): T | undefined {
+  for (const kind in table) {
+    if (table[kind].includes(value)) return kind;
+  }
+  return undefined;
+}
 
 function integer(value: string): number {
   const parsed = Number(value);
@@ -66,10 +117,6 @@ function amount(value: string): number {
   return parsed;
 }
 
-function segment(value: string): string {
-  return encodeURIComponent(value);
-}
-
 function usage(detail: string): CliError {
   return new CliError(ExitCode.usage, {
     title: "Command cannot run",
@@ -79,26 +126,71 @@ function usage(detail: string): CliError {
   });
 }
 
+function direction(value: string): Direction {
+  if (!isMember(directions, value)) throw usage("Direction must be north, east, south, or west.");
+  return value;
+}
+
+function resourceKind(value: string): ResourceKind {
+  if (!isMember(resourceKinds, value)) {
+    throw usage("Resource must be energy, materials, or inference.");
+  }
+  return value;
+}
+
+function structureKind(value: string): StructureKind {
+  const kind = kindForSpelling(structureSpellings, value);
+  if (!kind) {
+    throw usage(`Structure must be one of: ${Object.keys(structureSpellings).join(", ")}.`);
+  }
+  return kind;
+}
+
+function resourcesFrom(options: {
+  readonly energy?: number | undefined;
+  readonly materials?: number | undefined;
+  readonly inference?: number | undefined;
+}): Resources {
+  return {
+    energy: options.energy ?? 0,
+    materials: options.materials ?? 0,
+    inference: options.inference ?? 0,
+  };
+}
+
+function expiryFrom(expiresIn: number | undefined): string | undefined {
+  if (expiresIn === undefined) return undefined;
+  const expiration = new Date(Date.now() + expiresIn * 1_000);
+  return Number.isFinite(expiration.getTime()) ? expiration.toISOString() : undefined;
+}
+
+function createClient(runtime: Runtime, server: string, accessToken?: string): AgentWorldClient {
+  return new AgentWorldClient({
+    baseUrl: server,
+    ...(accessToken ? { accessToken } : {}),
+    fetch: runtime.fetchImplementation,
+    timeoutMs: runtime.timeoutMs,
+    userAgent: `agentworld-cli/${cliVersion}`,
+  });
+}
+
 async function refreshForProfile(
   runtime: Runtime,
   profileName: string,
   profile: Profile,
   credentials: StoredCredentials,
-): Promise<{ readonly credentials: StoredCredentials; readonly client: AgentWorldHttpClient }> {
+): Promise<{ readonly credentials: StoredCredentials; readonly client: AgentWorldClient }> {
   const refreshed = await refreshCredentials({
     server: profile.server,
     credentials,
     fetchImplementation: runtime.fetchImplementation,
+    timeoutMs: runtime.timeoutMs,
   });
   const boundCredentials = { ...refreshed, server: profile.server };
   await runtime.credentials.set(profileName, boundCredentials);
   return {
     credentials: boundCredentials,
-    client: new AgentWorldHttpClient(
-      profile.server,
-      boundCredentials.accessToken,
-      runtime.fetchImplementation,
-    ),
+    client: createClient(runtime, profile.server, boundCredentials.accessToken),
   };
 }
 
@@ -129,24 +221,20 @@ async function contextFor(
   ) {
     credentials = undefined;
   }
-  let client: AgentWorldHttpClient;
+  let client: AgentWorldClient;
   if (credentials && shouldRefreshCredentials(credentials)) {
     const refreshed = await refreshForProfile(runtime, resolvedName, profile, credentials);
     credentials = refreshed.credentials;
     client = refreshed.client;
   } else {
-    client = new AgentWorldHttpClient(
-      profile.server,
-      credentials?.accessToken,
-      runtime.fetchImplementation,
-    );
+    client = createClient(runtime, profile.server, credentials?.accessToken);
   }
   let world = options.world ?? profile.world;
   if (requireWorld && !world) {
-    const discovery = await client.request<{ readonly defaultWorldId?: string }>(
-      "GET",
-      "/.well-known/agentworld",
-      { authenticated: false },
+    // Discovery is public; an unauthenticated client keeps the bearer token off that request.
+    const discovery = await callApi(
+      () => createClient(runtime, profile.server).discover(),
+      runtime.timeoutMs,
     );
     world = discovery.defaultWorldId;
   }
@@ -155,8 +243,6 @@ async function contextFor(
   }
   return {
     client,
-    profileName: resolvedName,
-    profile,
     ...(world ? { world } : {}),
     ...(credentials?.refreshToken
       ? {
@@ -170,25 +256,23 @@ async function contextFor(
   };
 }
 
-async function request(
+function worldOf(context: RequestContext): string {
+  if (!context.world) throw usage("No world is selected.");
+  return context.world;
+}
+
+async function execute<T>(
   program: Command,
   runtime: Runtime,
-  method: HttpMethod,
-  path: (context: RequestContext) => string,
-  options: {
-    readonly body?: unknown;
-    readonly query?: Record<string, string | number | boolean | undefined>;
-  } = {},
-  requireWorld = true,
+  requireWorld: boolean,
+  operation: (client: AgentWorldClient, context: RequestContext, key: string) => Promise<T>,
 ): Promise<void> {
   const context = await contextFor(program, runtime, requireWorld);
-  const requestOptions = {
-    ...options,
-    ...(method === "GET" ? {} : { idempotencyKey: randomUUID() }),
-  };
-  let response: unknown;
+  // One key per user intent: transport retries and the post-refresh retry replay the same mutation.
+  const key = randomUUID();
+  let response: T;
   try {
-    response = await context.client.request(method, path(context), requestOptions);
+    response = await callApi(() => operation(context.client, context, key), runtime.timeoutMs);
   } catch (error) {
     if (
       !(error instanceof CliError) ||
@@ -198,26 +282,9 @@ async function request(
       throw error;
     }
     const refreshedClient = await context.refreshClient();
-    response = await refreshedClient.request(method, path(context), requestOptions);
+    response = await callApi(() => operation(refreshedClient, context, key), runtime.timeoutMs);
   }
   writeResult(runtime.writer, response, program.opts<GlobalOptions>().json);
-}
-
-function worldPath(context: RequestContext, suffix: string): string {
-  if (!context.world) throw usage("No world is selected.");
-  return `/v1/worlds/${segment(context.world)}${suffix}`;
-}
-
-function resourcesFrom(options: {
-  readonly energy?: number | undefined;
-  readonly materials?: number | undefined;
-  readonly inference?: number | undefined;
-}): Record<string, number> {
-  return {
-    energy: options.energy ?? 0,
-    materials: options.materials ?? 0,
-    inference: options.inference ?? 0,
-  };
 }
 
 export function createCli(overrides: Partial<Runtime> = {}): Command {
@@ -227,12 +294,13 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
     fetchImplementation: overrides.fetchImplementation ?? globalThis.fetch,
     writer: overrides.writer ?? processWriter,
     openBrowser: overrides.openBrowser ?? openSystemBrowser,
+    timeoutMs: overrides.timeoutMs ?? requestTimeoutMs(),
   };
   const program = new Command();
   program
     .name("agentworld")
     .description("Explore, build, negotiate, and compete in AgentWorld")
-    .version("0.1.0")
+    .version(cliVersion)
     .option("-j, --json", "write stable JSON to stdout", false)
     .option("-p, --profile <name>", "use a named server profile")
     .option("--server <url>", "override the profile server URL")
@@ -243,6 +311,11 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
       writeOut: (text) => runtime.writer.stdout(text.trimEnd()),
       writeErr: (text) => runtime.writer.stderr(text.trimEnd()),
     });
+
+  const act = <T>(operation: WorldOperation<T>): Promise<void> =>
+    execute(program, runtime, true, (client, context, key) =>
+      operation(client, worldOf(context), key),
+    );
 
   const profile = program
     .command("profile")
@@ -344,13 +417,11 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
         server,
         scopes: options.readOnly ? ["world:read", offlineScope] : allScopes,
         fetchImplementation: runtime.fetchImplementation,
+        timeoutMs: runtime.timeoutMs,
         ...(options.browser ? { openBrowser: runtime.openBrowser } : {}),
         notify: runtime.writer.stderr,
       });
-      const expiresAt =
-        tokens.expiresIn === undefined
-          ? undefined
-          : new Date(Date.now() + tokens.expiresIn * 1_000).toISOString();
+      const expiresAt = expiryFrom(tokens.expiresIn);
       await runtime.credentials.set(profileName, {
         accessToken: tokens.accessToken,
         server,
@@ -381,6 +452,7 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
             server: selectedProfile.server,
             credentials,
             fetchImplementation: runtime.fetchImplementation,
+            timeoutMs: runtime.timeoutMs,
           });
         }
       } finally {
@@ -401,7 +473,7 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
   program
     .command("worlds")
     .description("list available worlds")
-    .action(() => request(program, runtime, "GET", () => "/v1/worlds", {}, false));
+    .action(() => execute(program, runtime, false, (client) => client.worlds()));
   program
     .command("spawn [name]")
     .description("join the selected world")
@@ -409,111 +481,73 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
     .action((name: string | undefined, options: { name?: string }) => {
       const displayName = options.name ?? name;
       if (!displayName) throw usage("Provide a civilization name when joining a world.");
-      return request(program, runtime, "POST", (context) => worldPath(context, "/players"), {
-        body: { name: displayName },
-      });
+      const body: SpawnRequest = { name: displayName };
+      return act((client, world, key) => client.spawn(world, body, key));
     });
   program
     .command("status")
     .description("show civilization status")
-    .action(() => request(program, runtime, "GET", (context) => worldPath(context, "/me/status")));
+    .action(() => act((client, world) => client.status(world)));
   program
     .command("inventory")
     .description("show resource inventory")
-    .action(() =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/me/inventory")),
-    );
+    .action(() => act((client, world) => client.inventory(world)));
 
   program
     .command("look")
-    .description("inspect nearby world state")
-    .option("--scan", "perform a wider, inference-powered scan")
-    .action((options: { scan?: boolean }) =>
-      options.scan
-        ? request(program, runtime, "POST", (context) => worldPath(context, "/actions/scan"), {
-            body: {},
-          })
-        : request(program, runtime, "GET", (context) => worldPath(context, "/look")),
-    );
+    .description("inspect nearby world state without spending anything")
+    .action(() => act((client, world) => client.look(world)));
   program
     .command("scan")
     .description("perform a wider, inference-powered scan")
-    .action(() =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/actions/scan"), {
-        body: {},
-      }),
-    );
+    .action(() => act((client, world, key) => client.scan(world, key)));
   program
     .command("map")
     .description("show discovered map tiles")
     .option("--cursor <cursor>", "continue a previous page")
     .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/map"), {
-        query: options,
-      }),
+      act((client, world) => client.map(world, options.cursor)),
     );
   program
     .command("players")
     .description("list visible players")
     .option("--cursor <cursor>", "continue a previous page")
     .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/players"), {
-        query: options,
-      }),
+      act((client, world) => client.players(world, options.cursor)),
     );
   program
     .command("events")
     .description("list visible world events")
     .option("--cursor <cursor>", "continue a previous page")
     .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/events"), {
-        query: options,
-      }),
+      act((client, world) => client.events(world, options.cursor)),
     );
   program
     .command("leaderboard")
     .description("show current rankings")
-    .option("--cursor <cursor>", "continue a previous page")
-    .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/leaderboard"), {
-        query: options,
-      }),
-    );
+    .action(() => act((client, world) => client.leaderboard(world)));
 
   program
     .command("move <direction>")
     .description("move north, east, south, or west")
-    .action((direction: string) => {
-      if (!["north", "east", "south", "west"].includes(direction)) {
-        throw usage("Direction must be north, east, south, or west.");
-      }
-      return request(program, runtime, "POST", (context) => worldPath(context, "/actions/move"), {
-        body: { direction },
-      });
+    .action((value: string) => {
+      const body: MoveRequest = { direction: direction(value) };
+      return act((client, world, key) => client.move(world, body, key));
     });
   program
     .command("build <structure>")
     .description("construct a structure")
-    .action((structure: string) =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/actions/build"), {
-        body: {
-          structure:
-            structure === "compute-node"
-              ? "compute_node"
-              : structure === "defense-node"
-                ? "defense_node"
-                : structure,
-        },
-      }),
-    );
+    .action((structure: string) => {
+      const body: BuildRequest = { structure: structureKind(structure) };
+      return act((client, world, key) => client.build(world, body, key));
+    });
   program
     .command("harvest [resource]")
     .description("harvest the current tile")
-    .action((resource?: string) =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/actions/harvest"), {
-        body: resource ? { resource } : {},
-      }),
-    );
+    .action((resource?: string) => {
+      const body: HarvestRequest = resource ? { resource: resourceKind(resource) } : {};
+      return act((client, world, key) => client.harvest(world, body, key));
+    });
 
   const messages = program
     .command("messages")
@@ -523,64 +557,49 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
     .command("list")
     .option("--cursor <cursor>", "continue a previous page")
     .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/messages"), {
-        query: options,
-      }),
+      act((client, world) => client.messages(world, options.cursor)),
     );
   messages
     .command("send <recipient> <content>")
     .description("send a direct or alliance message")
     .option("--alliance", "recipient is an alliance", false)
-    .action((recipient: string, content: string, options: { alliance: boolean }) =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/messages"), {
-        body: {
-          ...(options.alliance ? { allianceId: recipient } : { recipientPlayerId: recipient }),
-          body: content,
-        },
-      }),
-    );
+    .action((recipient: string, content: string, options: { alliance: boolean }) => {
+      const body: SendMessageRequest = {
+        ...(options.alliance ? { allianceId: recipient } : { recipientPlayerId: recipient }),
+        body: content,
+      };
+      return act((client, world, key) => client.sendMessage(world, body, key));
+    });
 
   const moderation = program.command("moderation").description("block, mute, and report abuse");
   for (const operation of ["block", "unblock"] as const) {
     moderation
       .command(`${operation} <player-id>`)
       .action((playerId: string) =>
-        request(program, runtime, operation === "block" ? "PUT" : "DELETE", (context) =>
-          worldPath(context, `/blocks/${segment(playerId)}`),
-        ),
+        act((client, world, key) => client.setBlock(world, playerId, operation === "block", key)),
       );
   }
   for (const operation of ["mute", "unmute"] as const) {
     moderation
       .command(`${operation} <channel-id>`)
       .action((channelId: string) =>
-        request(program, runtime, operation === "mute" ? "PUT" : "DELETE", (context) =>
-          worldPath(context, `/mutes/${segment(channelId)}`),
-        ),
+        act((client, world, key) => client.setMute(world, channelId, operation === "mute", key)),
       );
   }
   moderation
     .command("report <player-id> <reason>")
     .option("--message <message-id>", "attach a visible message")
-    .action((playerId: string, reason: string, options: { message?: string }) =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/reports"), {
-        body: {
-          reportedPlayerId: playerId,
-          reason,
-          ...(options.message ? { messageId: options.message } : {}),
-        },
-      }),
-    );
+    .action((playerId: string, reason: string, options: { message?: string }) => {
+      const body: ReportRequest = {
+        reportedPlayerId: playerId,
+        reason,
+        ...(options.message ? { messageId: options.message } : {}),
+      };
+      return act((client, world, key) => client.report(world, body, key));
+    });
 
   const trades = program.command("trades").alias("trade").description("manage escrowed trades");
-  trades
-    .command("list")
-    .option("--cursor <cursor>", "continue a previous page")
-    .action((options: { cursor?: string }) =>
-      request(program, runtime, "GET", (context) => worldPath(context, "/trades"), {
-        query: options,
-      }),
-    );
+  trades.command("list").action(() => act((client, world) => client.trades(world)));
   trades
     .command("create <recipient>")
     .option("--offer-energy <amount>", "Energy offered", amount)
@@ -600,119 +619,89 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
           requestMaterials?: number;
           requestInference?: number;
         },
-      ) =>
-        request(program, runtime, "POST", (context) => worldPath(context, "/trades"), {
-          body: {
-            recipientPlayerId: recipient,
-            offered: resourcesFrom({
-              energy: options.offerEnergy,
-              materials: options.offerMaterials,
-              inference: options.offerInference,
-            }),
-            requested: resourcesFrom({
-              energy: options.requestEnergy,
-              materials: options.requestMaterials,
-              inference: options.requestInference,
-            }),
-          },
-        }),
+      ) => {
+        const body: TradeOfferRequest = {
+          recipientPlayerId: recipient,
+          offered: resourcesFrom({
+            energy: options.offerEnergy,
+            materials: options.offerMaterials,
+            inference: options.offerInference,
+          }),
+          requested: resourcesFrom({
+            energy: options.requestEnergy,
+            materials: options.requestMaterials,
+            inference: options.requestInference,
+          }),
+        };
+        return act((client, world, key) => client.offerTrade(world, body, key));
+      },
     );
   for (const operation of ["accept", "cancel"] as const) {
     trades
       .command(`${operation} <trade-id>`)
       .description(`${operation} a trade`)
       .action((tradeId: string) =>
-        request(
-          program,
-          runtime,
-          "POST",
-          (context) => worldPath(context, `/trades/${segment(tradeId)}/${operation}`),
-          { body: {} },
-        ),
+        act((client, world, key) => client.resolveTrade(world, tradeId, operation, key)),
       );
   }
 
   const alliances = program.command("alliances").alias("alliance").description("manage alliances");
-  alliances
-    .command("list")
-    .action(() => request(program, runtime, "GET", (context) => worldPath(context, "/alliances")));
-  alliances.command("create <name>").action((name: string) =>
-    request(program, runtime, "POST", (context) => worldPath(context, "/alliances"), {
-      body: { name },
-    }),
-  );
+  alliances.command("list").action(() => act((client, world) => client.alliances(world)));
+  alliances.command("create <name>").action((name: string) => {
+    const body: AllianceCreateRequest = { name };
+    return act((client, world, key) => client.createAlliance(world, body, key));
+  });
   alliances
     .command("invite <alliance-id> <player-id>")
-    .action((allianceId: string, playerId: string) =>
-      request(
-        program,
-        runtime,
-        "POST",
-        (context) => worldPath(context, `/alliances/${segment(allianceId)}/invites`),
-        { body: { playerId } },
-      ),
-    );
+    .action((allianceId: string, playerId: string) => {
+      const body: AllianceInviteRequest = { playerId };
+      return act((client, world, key) => client.inviteToAlliance(world, allianceId, body, key));
+    });
   alliances
     .command("accept <invitation-id>")
     .action((invitationId: string) =>
-      request(
-        program,
-        runtime,
-        "POST",
-        (context) => worldPath(context, `/alliance-invites/${segment(invitationId)}/accept`),
-        { body: {} },
-      ),
+      act((client, world, key) => client.acceptAllianceInvite(world, invitationId, key)),
     );
   alliances
     .command("leave <alliance-id>")
     .action((allianceId: string) =>
-      request(
-        program,
-        runtime,
-        "POST",
-        (context) => worldPath(context, `/alliances/${segment(allianceId)}/leave`),
-        { body: {} },
+      act((client, world, key) => client.leaveAlliance(world, allianceId, key)),
+    );
+  alliances
+    .command("leadership <alliance-id> <player-id>")
+    .description("transfer alliance leadership to a member")
+    .action((allianceId: string, playerId: string) =>
+      act((client, world, key) =>
+        client.transferAllianceLeadership(world, allianceId, playerId, key),
       ),
     );
   alliances
     .command("disband <alliance-id>")
     .action((allianceId: string) =>
-      request(program, runtime, "DELETE", (context) =>
-        worldPath(context, `/alliances/${segment(allianceId)}`),
-      ),
+      act((client, world, key) => client.disbandAlliance(world, allianceId, key)),
     );
 
   const hostility = program.command("hostility").description("declare or withdraw hostility");
-  hostility
-    .command("declare <player-id>")
-    .action((playerId: string) =>
-      request(
-        program,
-        runtime,
-        "PUT",
-        (context) => worldPath(context, `/relationships/${segment(playerId)}/hostility`),
-        { body: {} },
-      ),
-    );
-  hostility
-    .command("withdraw <player-id>")
-    .action((playerId: string) =>
-      request(program, runtime, "DELETE", (context) =>
-        worldPath(context, `/relationships/${segment(playerId)}/hostility`),
-      ),
-    );
+  for (const operation of ["declare", "withdraw"] as const) {
+    hostility
+      .command(`${operation} <player-id>`)
+      .action((playerId: string) =>
+        act((client, world, key) =>
+          client.setHostility(world, playerId, operation === "declare", key),
+        ),
+      );
+  }
   program
     .command("attack <structure-id>")
     .description("attack an adjacent hostile structure")
     .option("--inference <amount>", "additional Inference to spend", amount, 0)
-    .action((structureId: string, options: { inference: number }) =>
-      request(program, runtime, "POST", (context) => worldPath(context, "/actions/attack"), {
-        body: {
-          targetStructureId: structureId,
-          ...(options.inference > 0 ? { bonusInference: options.inference } : {}),
-        },
-      }),
-    );
+    .action((structureId: string, options: { inference: number }) => {
+      const body: AttackRequest = {
+        targetStructureId: structureId,
+        ...(options.inference > 0 ? { bonusInference: options.inference } : {}),
+      };
+      return act((client, world, key) => client.attack(world, body, key));
+    });
 
   return program;
 }

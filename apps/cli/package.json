@@ -19,9 +19,11 @@
     "clean": "tsc -b --clean",
     "dev": "tsx src/bin.ts",
     "test": "vitest run --root ../.. apps/cli",
-    "typecheck": "tsc -p tsconfig.test.json --pretty false"
+    "typecheck": "tsc -b --pretty false && tsc -p tsconfig.test.json --pretty false"
   },
   "dependencies": {
+    "@agentworld/api-client": "workspace:*",
+    "@agentworld/api-contract": "workspace:*",
     "commander": "14.0.3"
   },
   "devDependencies": {

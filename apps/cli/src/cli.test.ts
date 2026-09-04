@@ -1,9 +1,39 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, type Mock, vi } from "vitest";
 import { createCli } from "./cli.ts";
 import { ConfigStore, FileCredentialStore } from "./config.ts";
+import { CliError } from "./errors.ts";
+
+const server = "https://play.example.test";
+
+/** A profile bound to world `beta`, with captured output and an optional deadline override. */
+async function worldCli(options: {
+  readonly fetchMock: Mock<typeof fetch>;
+  readonly timeoutMs?: number;
+}) {
+  const directory = await mkdtemp(join(tmpdir(), "agentworld-cli-world-"));
+  const config = new ConfigStore(directory);
+  const credentials = new FileCredentialStore(directory);
+  await config.putProfile("test", { server, world: "beta" }, true);
+  await credentials.set("test", { accessToken: "token", server });
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const cli = createCli({
+    config,
+    credentials,
+    fetchImplementation: options.fetchMock,
+    writer: { stdout: (text) => stdout.push(text), stderr: (text) => stderr.push(text) },
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  });
+  return { cli, stdout, stderr };
+}
+
+function requestBody(fetchMock: Mock<typeof fetch>, call = 0): unknown {
+  const body = fetchMock.mock.calls[call]?.[1]?.body;
+  return body === undefined ? undefined : JSON.parse(String(body));
+}
 
 describe("CLI commands", () => {
   it("never attaches profile credentials to an ad-hoc server override", async () => {
@@ -136,31 +166,145 @@ describe("CLI commands", () => {
       ["alliances", "accept", "invite-one"],
       "POST",
       "https://play.example.test/v1/worlds/beta/alliance-invites/invite-one/accept",
+      {},
+    ],
+    [
+      ["alliances", "leave", "alliance-one"],
+      "POST",
+      "https://play.example.test/v1/worlds/beta/alliances/alliance-one/leave",
+      {},
+    ],
+    [
+      ["alliances", "leadership", "alliance-one", "player-two"],
+      "POST",
+      "https://play.example.test/v1/worlds/beta/alliances/alliance-one/leadership",
+      { playerId: "player-two" },
     ],
     [
       ["alliances", "disband", "alliance-one"],
       "DELETE",
       "https://play.example.test/v1/worlds/beta/alliances/alliance-one",
+      undefined,
     ],
-  ])("uses the canonical alliance endpoint for %j", async (arguments_, method, url) => {
-    const directory = await mkdtemp(join(tmpdir(), "agentworld-cli-alliance-"));
-    const config = new ConfigStore(directory);
-    const credentials = new FileCredentialStore(directory);
-    await config.putProfile("test", { server: "https://play.example.test", world: "beta" }, true);
+  ])("uses the canonical alliance endpoint for %j", async (arguments_, method, url, body) => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    const cli = createCli({
-      config,
-      credentials,
-      fetchImplementation: fetchMock,
-      writer: { stdout: () => undefined, stderr: () => undefined },
-    });
+    const { cli } = await worldCli({ fetchMock });
 
     await cli.parseAsync(["node", "agentworld", ...arguments_]);
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(url);
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe(method);
+    expect(requestBody(fetchMock)).toEqual(body);
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("idempotency-key")).toBeTruthy();
+  });
+
+  it("keeps look a read and no longer offers --scan", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(JSON.stringify({ tiles: [] }), { status: 200 }));
+    const { cli } = await worldCli({ fetchMock });
+
+    await cli.parseAsync(["node", "agentworld", "look"]);
+
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(String(url)).toBe("https://play.example.test/v1/worlds/beta/look");
+    expect(init?.method).toBe("GET");
+    expect(new Headers(init?.headers).get("user-agent")).toBe("agentworld-cli/0.1.0");
+
+    const { cli: second, stderr } = await worldCli({ fetchMock });
+    await expect(second.parseAsync(["node", "agentworld", "look", "--scan"])).rejects.toMatchObject(
+      { code: "commander.unknownOption" },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stderr.join("\n")).toContain("unknown option");
+  });
+
+  it.each([
+    ["harvest", [], {}],
+    ["harvest", ["materials"], { resource: "materials" }],
+  ])("sends the typed %s body for %j", async (command, extra, body) => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(JSON.stringify({ status: "completed" }), { status: 200 }));
+    const { cli } = await worldCli({ fetchMock });
+
+    await cli.parseAsync(["node", "agentworld", command, ...extra]);
+
+    expect(requestBody(fetchMock)).toEqual(body);
+  });
+
+  it.each([
+    ["move", "up"],
+    ["build", "castle"],
+    ["harvest", "gold"],
+  ])("rejects an unknown %s value locally as a usage error", async (command, value) => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const { cli } = await worldCli({ fetchMock });
+
+    await expect(cli.parseAsync(["node", "agentworld", command, value])).rejects.toMatchObject({
+      exitCode: 2,
+      problem: { code: "usage_error" },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("turns a non-JSON gateway failure into a network-category problem with the request id", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("<html><body>502 Bad Gateway</body></html>", {
+        status: 502,
+        headers: { "content-type": "text/html", "x-request-id": "edge-1" },
+      }),
+    );
+    const { cli, stdout } = await worldCli({ fetchMock });
+
+    await expect(cli.parseAsync(["node", "agentworld", "status"])).rejects.toMatchObject({
+      exitCode: 6,
+      problem: {
+        title: "Request failed (502)",
+        status: 502,
+        code: "HTTP_502",
+        requestId: "edge-1",
+        retryable: true,
+      },
+    });
+    expect(stdout).toEqual([]);
+  });
+
+  it("applies a per-attempt deadline, retries once with the same key, then fails as a timeout", async () => {
+    const fetchMock = vi.fn<typeof fetch>(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
+    );
+    const { cli } = await worldCli({ fetchMock, timeoutMs: 5 });
+
+    await expect(cli.parseAsync(["node", "agentworld", "move", "north"])).rejects.toMatchObject({
+      exitCode: 6,
+      problem: { code: "request_timeout", retryable: true, detail: "No response within 5 ms." },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const keys = fetchMock.mock.calls.map(([, init]) =>
+      new Headers(init?.headers).get("idempotency-key"),
+    );
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("validates AGENTWORLD_TIMEOUT_MS once at startup", () => {
+    vi.stubEnv("AGENTWORLD_TIMEOUT_MS", "soon");
+    try {
+      expect(() =>
+        createCli({ writer: { stdout: () => undefined, stderr: () => undefined } }),
+      ).toThrow(CliError);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("refreshes after a 401, persists rotated credentials, and reuses the mutation key", async () => {

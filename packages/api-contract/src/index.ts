@@ -303,7 +303,8 @@ export type ScanRequest = Static<typeof ScanRequest>;
 export const AttackRequest = Type.Object(
   {
     targetStructureId: Identifier,
-    bonusInference: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+    // The active ruleset owns the upper bound and rejects excess with INVALID_BONUS.
+    bonusInference: Type.Optional(SafeInteger),
   },
   { additionalProperties: false },
 );
@@ -420,6 +421,34 @@ export const AllianceInviteResponse = Type.Object(
   { additionalProperties: false },
 );
 export type AllianceInviteResponse = Static<typeof AllianceInviteResponse>;
+
+export const AllianceInviteAcceptResponse = Type.Object(
+  {
+    accepted: Type.Literal(true),
+    allianceId: Identifier,
+  },
+  { additionalProperties: false },
+);
+export type AllianceInviteAcceptResponse = Static<typeof AllianceInviteAcceptResponse>;
+
+export const AllianceAdministrationOperation = Type.Union([
+  Type.Literal("leave"),
+  Type.Literal("leadership"),
+  Type.Literal("disband"),
+]);
+export type AllianceAdministrationOperation = Static<typeof AllianceAdministrationOperation>;
+
+export const AllianceAdministrationResponse = Type.Object(
+  {
+    ok: Type.Literal(true),
+    operation: AllianceAdministrationOperation,
+    allianceId: Identifier,
+    // Present only for leadership transfers, naming the new leader.
+    playerId: Type.Optional(Identifier),
+  },
+  { additionalProperties: false },
+);
+export type AllianceAdministrationResponse = Static<typeof AllianceAdministrationResponse>;
 
 export const AllianceView = Type.Object(
   {
