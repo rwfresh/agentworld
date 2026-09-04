@@ -292,6 +292,9 @@ export function settlePassiveProduction(
     if (production === undefined) return structure;
     const elapsed = effectiveTick - structure.lastProductionTick;
     if (elapsed < 0) throw new RangeError("effective tick predates production state");
+    // One settlement credits at most one offline-cap chunk. The cursor advances only over the
+    // credited ticks, so anything beyond the cap stays ahead of it for a later settlement
+    // instead of being discarded.
     const creditedElapsed = Math.min(elapsed, ruleset.production.offlineCapTicks);
     const accumulated = structure.productionRemainderTicks + creditedElapsed;
     const intervals = Math.floor(accumulated / ruleset.production.intervalTicks);
@@ -301,10 +304,10 @@ export function settlePassiveProduction(
     ];
     const credit = resourceForKind(production.resource, production.amount * richness * intervals);
     produced = addResources(produced, credit);
-    changed = changed || elapsed > 0;
+    changed = changed || creditedElapsed > 0;
     return {
       ...structure,
-      lastProductionTick: effectiveTick,
+      lastProductionTick: tick(structure.lastProductionTick + creditedElapsed),
       productionRemainderTicks: remainder,
     };
   });
@@ -434,27 +437,19 @@ function decideMove(
   );
 }
 
+/**
+ * A player may build on their own starter-plot tiles or anywhere in contested/frontier territory.
+ * Every other tile of the starter reserve is off limits, allocated or not: unclaimed plots must
+ * stay intact for future spawns, and the unattackable reserve must not farm structure influence.
+ */
 function isBuildLocationValid(
   snapshot: GameSnapshot,
   player: CivilizationState,
   target: Coordinate,
+  ruleset: Ruleset,
 ): boolean {
-  if (
-    snapshot.players.some(
-      (candidate) =>
-        candidate.id !== player.id &&
-        candidate.homePlot.some((coordinate) => sameCoordinate(coordinate, target)),
-    )
-  ) {
-    return false;
-  }
   if (player.homePlot.some((value) => sameCoordinate(value, target))) return true;
-  return snapshot.structures.some(
-    (structure) =>
-      structure.ownerId === player.id &&
-      structure.status !== "destroyed" &&
-      isCardinallyAdjacent(structure.coordinate, target),
-  );
+  return zoneAt(snapshot.world, target, ruleset) !== "starter";
 }
 
 function decideBuild(
@@ -479,8 +474,11 @@ function decideBuild(
   ) {
     return failure("TILE_OCCUPIED", "the current tile already contains a structure");
   }
-  if (!isBuildLocationValid(prepared.state, player, player.position)) {
-    return failure("BUILD_LOCATION_INVALID", "build on a home tile or beside owned territory");
+  if (!isBuildLocationValid(prepared.state, player, player.position, ruleset)) {
+    return failure(
+      "BUILD_LOCATION_INVALID",
+      "build on your own starter plot or in contested or frontier territory",
+    );
   }
   const constructions = prepared.state.structures.filter(
     (structure) => structure.ownerId === player.id && structure.status === "constructing",
@@ -716,8 +714,18 @@ function decideDeclareHostility(
   const existing = prepared.state.hostilities.find(
     (value) => value.aggressorId === actor.id && value.defenderId === defender.id,
   );
-  if (existing?.withdrawnAtTick === undefined && existing !== undefined) {
-    return failure("ALREADY_HOSTILE", "hostility is already active");
+  if (existing !== undefined) {
+    if (existing.withdrawnAtTick === undefined) {
+      return failure("ALREADY_HOSTILE", "hostility is already active");
+    }
+    const allowedAt = redeclarationAllowedAt(existing, ruleset);
+    if (effectiveTick < allowedAt) {
+      return failure(
+        "COOLDOWN_ACTIVE",
+        "a withdrawn hostility cannot be re-declared until its warmup and retaliation window end",
+        allowedAt,
+      );
+    }
   }
   const hostility: HostilityState = {
     aggressorId: actor.id,
@@ -785,6 +793,35 @@ type AttackPermission =
   | { readonly allowed: true }
   | { readonly allowed: false; readonly violation: RuleViolation };
 
+/**
+ * A declaration made while its declarer was already under the target's active declaration is a
+ * counter-declaration. It keeps the defender's rights but grants the original aggressor nothing;
+ * otherwise declaring back would hand the aggressor an immediate strike.
+ */
+function isCounterDeclaration(
+  incoming: HostilityState,
+  outgoing: HostilityState | undefined,
+): boolean {
+  return (
+    outgoing !== undefined &&
+    outgoing.declaredAtTick <= incoming.declaredAtTick &&
+    (outgoing.withdrawnAtTick === undefined || outgoing.withdrawnAtTick > incoming.declaredAtTick)
+  );
+}
+
+/** The earliest tick at which a withdrawn declaration may be renewed against the same target. */
+function redeclarationAllowedAt(withdrawn: HostilityState, ruleset: Ruleset): Tick {
+  if (withdrawn.withdrawnAtTick === undefined) throw new Error("declaration is not withdrawn");
+  // Withdrawing and re-declaring must never beat waiting out the original warmup, and the
+  // withdrawal stays binding for the defender's whole retaliation window.
+  return tick(
+    Math.max(
+      withdrawn.declaredAtTick + ruleset.combat.hostilityWarmupTicks,
+      withdrawn.withdrawnAtTick + ruleset.combat.retaliationAfterWithdrawalTicks,
+    ),
+  );
+}
+
 function attackPermission(
   hostilities: readonly HostilityState[],
   actorId: PlayerId,
@@ -792,11 +829,23 @@ function attackPermission(
   effectiveTick: Tick,
   ruleset: Ruleset,
 ): AttackPermission {
-  const actorDeclaration = hostilities.find(
+  const incoming = hostilities.find(
+    (value) => value.aggressorId === targetId && value.defenderId === actorId,
+  );
+  const outgoing = hostilities.find(
     (value) => value.aggressorId === actorId && value.defenderId === targetId,
   );
-  if (actorDeclaration?.withdrawnAtTick === undefined && actorDeclaration !== undefined) {
-    const allowedAt = tick(actorDeclaration.declaredAtTick + ruleset.combat.hostilityWarmupTicks);
+  // Retaliation is evaluated first so a defender who declares back keeps the immediate right to
+  // strike; their own declaration's warmup never delays them.
+  if (incoming !== undefined && !isCounterDeclaration(incoming, outgoing)) {
+    if (incoming.withdrawnAtTick === undefined) return { allowed: true };
+    const retaliationEnds = tick(
+      incoming.withdrawnAtTick + ruleset.combat.retaliationAfterWithdrawalTicks,
+    );
+    if (effectiveTick <= retaliationEnds) return { allowed: true };
+  }
+  if (outgoing !== undefined && outgoing.withdrawnAtTick === undefined) {
+    const allowedAt = tick(outgoing.declaredAtTick + ruleset.combat.hostilityWarmupTicks);
     return effectiveTick >= allowedAt
       ? { allowed: true }
       : {
@@ -807,16 +856,6 @@ function attackPermission(
             retryAtTick: allowedAt,
           },
         };
-  }
-  const targetDeclaration = hostilities.find(
-    (value) => value.aggressorId === targetId && value.defenderId === actorId,
-  );
-  if (targetDeclaration !== undefined) {
-    if (targetDeclaration.withdrawnAtTick === undefined) return { allowed: true };
-    const retaliationEnds = tick(
-      targetDeclaration.withdrawnAtTick + ruleset.combat.retaliationAfterWithdrawalTicks,
-    );
-    if (effectiveTick <= retaliationEnds) return { allowed: true };
   }
   return {
     allowed: false,
@@ -864,6 +903,12 @@ function decideAttack(
   let target = prepared.state.structures.find((value) => value.id === command.targetStructureId);
   if (actor === undefined) throw new Error("prepared player is missing");
   if (target === undefined) return failure("TARGET_NOT_FOUND", "target structure not found");
+  // Hidden information wins over a more specific error: a structure that is neither adjacent
+  // nor on a discovered tile is reported exactly like an unknown ID.
+  const adjacent = isCardinallyAdjacent(actor.position, target.coordinate);
+  if (!adjacent && !actor.discoveredTileKeys.includes(coordinateKey(target.coordinate))) {
+    return failure("TARGET_NOT_FOUND", "target structure not found");
+  }
   if (target.ownerId === actor.id) return failure("SELF_TARGET", "a player cannot attack itself");
   if (target.status === "destroyed")
     return failure("TARGET_DESTROYED", "target is already destroyed");
@@ -871,7 +916,7 @@ function decideAttack(
   if (defender === undefined) return failure("TARGET_NOT_FOUND", "target owner not found");
   if (sameAlliance(actor, defender))
     return failure("ALLIED_TARGET", "allies cannot attack each other");
-  if (!isCardinallyAdjacent(actor.position, target.coordinate)) {
+  if (!adjacent) {
     return failure("TARGET_NOT_ADJACENT", "target structure must be cardinally adjacent");
   }
   if (zoneAt(prepared.state.world, target.coordinate, ruleset) === "starter") {

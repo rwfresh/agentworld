@@ -8,6 +8,7 @@ import {
   generateWorldTiles,
   playerId,
   starterPlotForSlot,
+  starterPlotSlotAt,
   tileAt,
   worldId,
   zoneAt,
@@ -48,9 +49,44 @@ describe("deterministic world generation", () => {
     expect(() => starterPlotForSlot(world, 512, BETA_V1_RULESET)).toThrow(RangeError);
   });
 
+  it("maps every plot tile back to its slot and nothing else to any slot", () => {
+    for (let slot = 0; slot < BETA_V1_RULESET.map.maxStarterPlots; slot += 1) {
+      for (const tile of starterPlotForSlot(world, slot, BETA_V1_RULESET).tiles) {
+        if (starterPlotSlotAt(world, tile, BETA_V1_RULESET) !== slot) {
+          throw new Error(`tile ${tile.x},${tile.y} did not map back to slot ${slot}`);
+        }
+      }
+    }
+    expect(starterPlotSlotAt(world, coordinate(64, 111), BETA_V1_RULESET)).toBe(480);
+    // Reserve rows above and below the 16 used plot rows hold no plot.
+    expect(zoneAt(world, coordinate(96, 70), BETA_V1_RULESET)).toBe("starter");
+    expect(starterPlotSlotAt(world, coordinate(96, 70), BETA_V1_RULESET)).toBeUndefined();
+    expect(starterPlotSlotAt(world, coordinate(64, 112), BETA_V1_RULESET)).toBeUndefined();
+    // Tiles just outside the reserve on either side belong to no plot either.
+    expect(starterPlotSlotAt(world, coordinate(63, 80), BETA_V1_RULESET)).toBeUndefined();
+    expect(starterPlotSlotAt(world, coordinate(128, 80), BETA_V1_RULESET)).toBeUndefined();
+    expect(starterPlotSlotAt(world, coordinate(40, 96), BETA_V1_RULESET)).toBeUndefined();
+    expect(starterPlotSlotAt(world, coordinate(0, 0), BETA_V1_RULESET)).toBeUndefined();
+  });
+
   it("uses cardinal-distance visibility and clips it at map edges", () => {
     expect(coordinatesWithinRadius(world, coordinate(96, 96), 3)).toHaveLength(25);
     expect(coordinatesWithinRadius(world, coordinate(0, 0), 3)).toHaveLength(10);
+    expect(coordinatesWithinRadius(world, coordinate(-2, 0), 3)).toEqual([
+      coordinate(0, 0),
+      coordinate(1, 0),
+      coordinate(0, 1),
+    ]);
+  });
+
+  it("bounds visibility work by the world rather than by the requested radius", () => {
+    // Without clamping, this would iterate a (2 × 10⁶ + 1)² square before filtering.
+    const everything = coordinatesWithinRadius(world, coordinate(0, 0), 1_000_000);
+    expect(everything).toHaveLength(192 * 192);
+    expect(new Set(everything.map((value) => `${value.x},${value.y}`)).size).toBe(192 * 192);
+    expect(
+      coordinatesWithinRadius(world, coordinate(96, 96), Number.MAX_SAFE_INTEGER),
+    ).toHaveLength(192 * 192);
   });
 
   it("can materialize every tile exactly once", () => {

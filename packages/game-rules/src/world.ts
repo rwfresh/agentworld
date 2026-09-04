@@ -163,6 +163,30 @@ export function generateWorldTiles(world: WorldDescriptor, ruleset: Ruleset): re
   return tiles;
 }
 
+interface StarterPlotLayout {
+  readonly plotSize: number;
+  readonly plotsPerRow: number;
+  readonly usedRows: number;
+  readonly reserveX: number;
+  readonly reserveY: number;
+  /** Plot rows are centered vertically inside the reserve when fewer rows than columns are used. */
+  readonly centeredRowOffset: number;
+}
+
+function starterPlotLayout(world: WorldDescriptor, ruleset: Ruleset): StarterPlotLayout {
+  const plotSize = ruleset.map.starterPlotSize;
+  const plotsPerRow = Math.floor(ruleset.map.starterReserveSize / plotSize);
+  const usedRows = Math.ceil(ruleset.map.maxStarterPlots / plotsPerRow);
+  return {
+    plotSize,
+    plotsPerRow,
+    usedRows,
+    reserveX: Math.floor((world.width - ruleset.map.starterReserveSize) / 2),
+    reserveY: Math.floor((world.height - ruleset.map.starterReserveSize) / 2),
+    centeredRowOffset: Math.floor((plotsPerRow - usedRows) / 2),
+  };
+}
+
 export function starterPlotForSlot(
   world: WorldDescriptor,
   slot: number,
@@ -174,23 +198,39 @@ export function starterPlotForSlot(
       `starter plot slot must be between 0 and ${ruleset.map.maxStarterPlots - 1}`,
     );
   }
-  const plotSize = ruleset.map.starterPlotSize;
-  const plotsPerRow = Math.floor(ruleset.map.starterReserveSize / plotSize);
-  const usedRows = Math.ceil(ruleset.map.maxStarterPlots / plotsPerRow);
-  const reserveX = Math.floor((world.width - ruleset.map.starterReserveSize) / 2);
-  const reserveY = Math.floor((world.height - ruleset.map.starterReserveSize) / 2);
-  const centeredRowOffset = Math.floor((plotsPerRow - usedRows) / 2);
+  const layout = starterPlotLayout(world, ruleset);
   const origin = coordinate(
-    reserveX + (slot % plotsPerRow) * plotSize,
-    reserveY + (Math.floor(slot / plotsPerRow) + centeredRowOffset) * plotSize,
+    layout.reserveX + (slot % layout.plotsPerRow) * layout.plotSize,
+    layout.reserveY +
+      (Math.floor(slot / layout.plotsPerRow) + layout.centeredRowOffset) * layout.plotSize,
   );
   const tiles: Coordinate[] = [];
-  for (let y = 0; y < plotSize; y += 1) {
-    for (let x = 0; x < plotSize; x += 1) {
+  for (let y = 0; y < layout.plotSize; y += 1) {
+    for (let x = 0; x < layout.plotSize; x += 1) {
       tiles.push(coordinate(origin.x + x, origin.y + y));
     }
   }
   return ownerId === undefined ? { slot, origin, tiles } : { slot, ownerId, origin, tiles };
+}
+
+/**
+ * The inverse of `starterPlotForSlot`: the slot whose plot contains the tile, whether or not that
+ * slot has been allocated. Reserve tiles outside the plot rows and tiles outside the reserve have
+ * no slot.
+ */
+export function starterPlotSlotAt(
+  world: WorldDescriptor,
+  target: Coordinate,
+  ruleset: Ruleset,
+): number | undefined {
+  const layout = starterPlotLayout(world, ruleset);
+  const column = Math.floor((target.x - layout.reserveX) / layout.plotSize);
+  const row = Math.floor((target.y - layout.reserveY) / layout.plotSize) - layout.centeredRowOffset;
+  if (column < 0 || column >= layout.plotsPerRow || row < 0 || row >= layout.usedRows) {
+    return undefined;
+  }
+  const slot = row * layout.plotsPerRow + column;
+  return slot < ruleset.map.maxStarterPlots ? slot : undefined;
 }
 
 export function coordinatesWithinRadius(
@@ -201,15 +241,16 @@ export function coordinatesWithinRadius(
   if (!Number.isSafeInteger(radius) || radius < 0) {
     throw new RangeError("radius must be a non-negative integer");
   }
+  // Clamp to the world before iterating so a large radius costs at most one pass over the map.
+  const minimumX = Math.max(0, center.x - radius);
+  const maximumX = Math.min(world.width - 1, center.x + radius);
+  const minimumY = Math.max(0, center.y - radius);
+  const maximumY = Math.min(world.height - 1, center.y + radius);
   const result: Coordinate[] = [];
-  for (let y = center.y - radius; y <= center.y + radius; y += 1) {
-    for (let x = center.x - radius; x <= center.x + radius; x += 1) {
-      const candidate = coordinate(x, y);
-      if (
-        isInsideWorld(world, candidate) &&
-        Math.abs(x - center.x) + Math.abs(y - center.y) <= radius
-      ) {
-        result.push(candidate);
+  for (let y = minimumY; y <= maximumY; y += 1) {
+    for (let x = minimumX; x <= maximumX; x += 1) {
+      if (Math.abs(x - center.x) + Math.abs(y - center.y) <= radius) {
+        result.push(coordinate(x, y));
       }
     }
   }

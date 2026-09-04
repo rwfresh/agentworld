@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertValidRuleset,
   BETA_V1_RULESET,
   canAfford,
   debitResources,
@@ -11,6 +12,39 @@ import {
   tick,
   validateRuleset,
 } from "../src/index.ts";
+
+type UnknownRecord = Readonly<Record<string, unknown>>;
+
+const isRecord = (value: unknown): value is UnknownRecord =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** A copy of `value` with the dotted `path` replaced by `leaf`, sharing every untouched branch. */
+function setPath(value: unknown, path: string, leaf: unknown): unknown {
+  const [head, ...rest] = path.split(".");
+  if (head === undefined || head === "") return leaf;
+  if (!isRecord(value)) throw new Error(`cannot descend into ${path}`);
+  return { ...value, [head]: setPath(value[head], rest.join("."), leaf) };
+}
+
+/** A copy of `value` without the dotted `path`. */
+function deletePath(value: unknown, path: string): unknown {
+  const [head, ...rest] = path.split(".");
+  if (head === undefined || !isRecord(value)) throw new Error(`cannot delete ${path}`);
+  if (rest.length === 0) {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => key !== head));
+  }
+  return { ...value, [head]: deletePath(value[head], rest.join(".")) };
+}
+
+function leafPaths(value: unknown, prefix = ""): readonly string[] {
+  if (!isRecord(value)) return [prefix];
+  return Object.entries(value).flatMap(([key, child]) =>
+    leafPaths(child, prefix === "" ? key : `${prefix}.${key}`),
+  );
+}
+
+const issuePaths = (value: unknown): readonly string[] =>
+  validateRuleset(value).map((issue) => issue.path);
 
 describe("beta-v1 ruleset", () => {
   it("contains the agreed beta balance", () => {
@@ -51,6 +85,148 @@ describe("beta-v1 ruleset", () => {
       influence: 25,
     });
     expect(validateRuleset(BETA_V1_RULESET)).toEqual([]);
+  });
+});
+
+describe("ruleset shape validation", () => {
+  it("rejects roots that are not objects without dereferencing them", () => {
+    expect(validateRuleset(undefined)).toEqual([{ path: "ruleset", message: "is required" }]);
+    expect(validateRuleset(null)).toEqual([{ path: "ruleset", message: "must be an object" }]);
+    expect(validateRuleset([])).toEqual([{ path: "ruleset", message: "must be an object" }]);
+    expect(validateRuleset("beta-v1")).toEqual([{ path: "ruleset", message: "must be an object" }]);
+  });
+
+  it("reports a missing section by path instead of throwing", () => {
+    expect(validateRuleset(deletePath(BETA_V1_RULESET, "trust"))).toEqual([
+      { path: "trust", message: "is required" },
+    ]);
+    expect(validateRuleset(deletePath(BETA_V1_RULESET, "movement.terrainEnergyCost"))).toEqual([
+      { path: "movement.terrainEnergyCost", message: "is required" },
+    ]);
+  });
+
+  it("rejects structures given as an array", () => {
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "structures", []))).toEqual([
+      { path: "structures", message: "must be an object" },
+    ]);
+  });
+
+  it("rejects a string where a number belongs", () => {
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "combat.baseDamage", "30"))).toEqual([
+      { path: "combat.baseDamage", message: "must be a number" },
+    ]);
+    expect(
+      validateRuleset(setPath(BETA_V1_RULESET, "structures.generator.cost.materials", "60")),
+    ).toEqual([{ path: "structures.generator.cost.materials", message: "must be a number" }]);
+  });
+
+  it("rejects unknown structure types and terrains", () => {
+    const barracks = { cost: resources(), buildTimeTicks: 1, maxHp: 1, influence: 0 };
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "structures.barracks", barracks))).toEqual([
+      { path: "structures.barracks", message: "is not a known structure type" },
+    ]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "movement.terrainEnergyCost.lava", 9))).toEqual(
+      [{ path: "movement.terrainEnergyCost.lava", message: "is not a known terrain" }],
+    );
+  });
+
+  it("validates optional structure fields and the pinned generator", () => {
+    expect(
+      validateRuleset(setPath(BETA_V1_RULESET, "structures.generator.production.resource", "gold")),
+    ).toEqual([
+      {
+        path: "structures.generator.production.resource",
+        message: "must be one of energy, materials, inference",
+      },
+    ]);
+    expect(
+      validateRuleset(setPath(BETA_V1_RULESET, "structures.command-node.starterOnly", "yes")),
+    ).toEqual([{ path: "structures.command-node.starterOnly", message: "must be a boolean" }]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "generation.algorithm", "perlin"))).toEqual([
+      { path: "generation.algorithm", message: "must name a supported, immutable map generator" },
+    ]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "id", ""))).toEqual([
+      { path: "id", message: "must be a non-empty string" },
+    ]);
+  });
+
+  it("requires every leaf of the beta ruleset except the optional starter flag", () => {
+    const optional = new Set(["structures.command-node.starterOnly"]);
+    for (const path of leafPaths(BETA_V1_RULESET)) {
+      const paths = issuePaths(deletePath(BETA_V1_RULESET, path));
+      if (optional.has(path)) {
+        expect(paths).toEqual([]);
+      } else if (!paths.includes(path)) {
+        throw new Error(`deleting ${path} was not reported (got ${paths.join(", ") || "none"})`);
+      }
+    }
+  });
+
+  it("type-checks every numeric leaf before any arithmetic runs", () => {
+    const record = BETA_V1_RULESET as unknown as UnknownRecord;
+    const numericLeaves = leafPaths(record).filter((path) => {
+      const value = path.split(".").reduce<unknown>((cursor, key) => {
+        return isRecord(cursor) ? cursor[key] : undefined;
+      }, record);
+      return typeof value === "number";
+    });
+    expect(numericLeaves.length).toBeGreaterThan(60);
+    for (const path of numericLeaves) {
+      expect(validateRuleset(setPath(BETA_V1_RULESET, path, "1"))).toEqual([
+        { path, message: "must be a number" },
+      ]);
+    }
+  });
+
+  it("narrows unknown input through assertValidRuleset and lists every issue on failure", () => {
+    const parsed: unknown = JSON.parse(JSON.stringify(BETA_V1_RULESET));
+    expect(assertValidRuleset(parsed)).toBe(parsed);
+    expect(() => assertValidRuleset(deletePath(BETA_V1_RULESET, "scoring"))).toThrow(
+      "scoring: is required",
+    );
+    expect(() =>
+      assertValidRuleset(
+        setPath(setPath(BETA_V1_RULESET, "trust.tier2AgeTicks", -1), "scoring.energyPerPoint", 0),
+      ),
+    ).toThrow(
+      "trust.tier2AgeTicks: must be a non-negative safe integer; scoring.energyPerPoint: must be a positive safe integer",
+    );
+  });
+});
+
+describe("ruleset value validation", () => {
+  it.each([
+    ["combat.retaliationAfterWithdrawalTicks", -1],
+    ["combat.influencePerDestruction", -25],
+    ["combat.influencePerOpponentWindow", 1.5],
+    ["combat.influenceWindowTicks", 0],
+    ["combat.weakOpponentPowerRatio", 1.5],
+    ["combat.weakOpponentPowerRatio", Number.NaN],
+    ["trust.tier1SuccessfulMutations", -1],
+    ["trust.tier1CompletedStructures", 0.5],
+    ["trust.tier2AgeTicks", -3_600],
+    ["trust.tier2SuccessfulMutations", Number.POSITIVE_INFINITY],
+    ["trust.tier2EarnedResources", -100],
+    ["scoring.contestedTile", -10],
+    ["scoring.frontierTile", 2.5],
+    ["scoring.energyPerPoint", 0],
+    ["scoring.materialsPerPoint", -50],
+    ["scoring.inferencePerPoint", 0],
+    ["look.radius", 193],
+    ["scan.radius", 500],
+  ] as const)("rejects %s = %s", (path, value) => {
+    expect(issuePaths(setPath(BETA_V1_RULESET, path, value))).toEqual([path]);
+  });
+
+  it("accepts boundary values that the rules can evaluate", () => {
+    const zeroed = ["combat.retaliationAfterWithdrawalTicks", "combat.influencePerDestruction"];
+    for (const path of zeroed) {
+      expect(validateRuleset(setPath(BETA_V1_RULESET, path, 0))).toEqual([]);
+    }
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "look.radius", 192))).toEqual([]);
+    expect(validateRuleset(setPath(BETA_V1_RULESET, "trust.tier1SuccessfulMutations", 0))).toEqual(
+      [],
+    );
   });
 });
 

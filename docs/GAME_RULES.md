@@ -1,17 +1,16 @@
 # AgentWorld Beta Game Rules
 
 **Ruleset:** `beta-v1`
-**Status:** authoritative complete-beta design; configuration values are
-mirrored in `config/rulesets/beta-v1.yaml`
+**Status:** authoritative and implemented; every rule in this document is
+enforced by the pure rules package (`packages/game-rules`) and the server, and
+configuration values are mirrored in `config/rulesets/beta-v1.yaml`
 
-This is the human-readable specification for complete beta gameplay. For rules
-that are implemented, the pure rules package and its tests are the executable
-specification; a mismatch is a release blocker. The current running vertical
-slice does not implement every rule below—especially complete trust gating,
-alliance limits/freezing, scheduled trade expiry, scoring, and season
-finalization. See `ARCHITECTURE.md` and `API.md` for the implementation
-inventory, and do not infer that a documented rule has a live route or worker
-until its tests demonstrate it.
+This is the human-readable specification for beta gameplay. The rules package,
+the server, and their tests are the executable specification: a documented rule
+counts as live only while its tests demonstrate it, and a mismatch between this
+document and the implementation is a release blocker. `ARCHITECTURE.md`
+describes the transaction flow that applies these rules and `API.md` the wire
+contract that exposes them.
 
 ## Core model
 
@@ -39,11 +38,11 @@ version is part of the ruleset hash. Re-generating the same version and seed
 must produce the same result. The seed is never player-facing. Richness bands
 are:
 
-| Zone | Richness per resource | PvP | Structure territory score |
-|---|---:|---|---:|
-| Personal starter plot | 1 | Disabled | 0 |
-| Contested | 1–2 | Enabled | 10 |
-| Frontier | 2–3 | Enabled | 25 |
+| Zone | Richness per resource | PvP | Building | Structure territory score |
+|---|---:|---|---|---:|
+| Starter reserve (incl. personal plots) | 1 | Disabled | Own plot only | 0 |
+| Contested | 1–2 | Enabled | Any empty tile | 10 |
+| Frontier | 2–3 | Enabled | Any empty tile | 25 |
 
 Terrain affects movement Energy cost only:
 
@@ -116,14 +115,25 @@ still charges the action cost before crediting its yield.
 
 ## Building and territory
 
-A player may build only on their current tile when it is:
+A player may build only on their current tile, and only when that tile holds no
+live or constructing structure and is either:
 
-- an unoccupied tile in their personal starter plot; or
-- an unoccupied tile cardinally adjacent to a live/constructing tile they own.
+- one of the tiles of their own personal starter plot; or
+- in contested or frontier territory.
 
-The action fails on another player's starter plot, beyond the world boundary,
-or when two constructions are already active. The database enforces at most one
-live or constructing structure per tile.
+There is no adjacency requirement: the commander walks out of the reserve and
+founds a site on any empty contested or frontier tile. (This replaced the
+original rule that required cardinal adjacency to an owned structure, which
+left a plot surrounded by spawned neighbours with room for exactly one more
+structure.)
+
+Every other tile of the 64×64 starter reserve is never buildable, whether or
+not the plot it belongs to has been allocated: unclaimed plots stay intact for
+future spawns, and the unattackable reserve cannot be used to farm structure
+influence. The action fails with `BUILD_LOCATION_INVALID` on such tiles, with
+`TILE_OCCUPIED` on an occupied tile, and with `CONSTRUCTION_LIMIT_REACHED` when
+two constructions are already active. The database additionally enforces at
+most one live or constructing structure per tile.
 
 Construction atomically spends bound resources first, claims the tile, creates
 the structure at half maximum HP, and schedules completion.
@@ -152,10 +162,16 @@ Active producing structures create resources for complete 600-tick intervals.
 Production is settled lazily on mutations, durable worker sweeps, and season
 finalization. Reads project the same value without changing state.
 
-The elapsed interval considered in one offline settlement is capped at 86,400
-ticks (24 hours). Partial intervals remain at the settlement cursor for a later
-calculation. Each interval can be credited only once, including across retries,
-worker duplication, and concurrent actions.
+Each structure carries a settlement cursor. One settlement advances the cursor
+by at most 86,400 ticks (24 hours, the offline cap) and credits the complete
+intervals inside that chunk; ticks left over below one complete interval stay
+recorded at the cursor and count toward the next interval. Elapsed time beyond
+the cap is never discarded: the cursor stops at the end of the credited chunk,
+so the remaining ticks are credited by later settlements, one further 24-hour
+chunk each, and in full by season finalization, which settles chunk after chunk
+through the final tick. A read projects exactly one chunk, the same amount the
+next mutation would settle. Each interval can be credited only once, including
+across retries, worker duplication, and concurrent actions.
 
 ## Social systems
 
@@ -223,13 +239,26 @@ the aggressor waits 900 ticks before attacking, while the defender may
 retaliate immediately. Withdrawing ends the aggressor's attack permission
 immediately, but the defender retains retaliation rights for 900 ticks.
 
+A defender may declare hostility back. A declaration made while its declarer
+was already under the target's active declaration is a counter-declaration: it
+keeps the defender's immediate retaliation right and does not shorten the
+original aggressor's warmup, because being counter-declared upon grants the
+aggressor no retaliation right. If both players declare in the same tick, both
+wait out their warmups. A withdrawal is binding: the same player cannot
+re-declare on the same target until both the withdrawn declaration's warmup and
+its 900-tick retaliation window would have elapsed (`COOLDOWN_ACTIVE` with a
+retry tick), so withdrawing and re-declaring can never beat waiting.
+
 Alliance members cannot declare or attack one another. Joining the same
-alliance removes incompatible hostility rights transactionally. Protected
-starter plots can never be attacked, regardless of relationships.
+alliance removes incompatible hostility rights transactionally. Structures in
+the starter reserve can never be attacked, regardless of relationships.
 
 An attack:
 
-- targets an adjacent hostile live/constructing structure;
+- targets a cardinally adjacent hostile live/constructing structure; a target
+  that is neither adjacent to the commander nor on a tile the attacker has
+  discovered is reported as `TARGET_NOT_FOUND`, exactly like an unknown ID, so
+  probing cannot confirm that undiscovered structures exist;
 - costs 20 Energy plus 5 base Inference;
 - has a 120-tick cooldown;
 - deals 30 base damage;
