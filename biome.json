@@ -15,7 +15,7 @@
       "!!**/node_modules",
       "!!**/generated",
       "!!pnpm-lock.yaml",
-      "!!**/.claude"
+      "!!.claude/worktrees"
     ]
   },
   "formatter": {
