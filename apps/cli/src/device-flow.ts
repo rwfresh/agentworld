@@ -230,7 +230,9 @@ export async function loginWithDevice(options: DeviceFlowOptions): Promise<Token
   const deadline = now() + authorization.expiresIn * 1_000;
   let interval = authorization.interval;
   while (now() < deadline) {
-    await sleep(interval * 1_000);
+    // Never sleep past the code's lifetime, and never send a token request for an expired code.
+    await sleep(Math.min(interval * 1_000, deadline - now()));
+    if (now() >= deadline) break;
     let response: Response;
     try {
       response = await fetchImplementation(tokenEndpoint, {

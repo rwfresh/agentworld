@@ -113,6 +113,39 @@ describe("device authorization", () => {
     }
   });
 
+  it("stops polling at the code's expiry even when the interval is longer than its lifetime", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({})))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            device_code: "device-secret",
+            user_code: "ABCD-EFGH",
+            verification_uri: "https://play.example.test/device",
+            expires_in: 30,
+            interval: 60,
+          }),
+        ),
+      );
+    let clock = 0;
+    const sleeps: number[] = [];
+    await expect(
+      loginWithDevice({
+        server: "https://play.example.test",
+        scopes: ["world:read"],
+        fetchImplementation: fetchMock,
+        sleep: async (milliseconds) => {
+          sleeps.push(milliseconds);
+          clock += milliseconds;
+        },
+        now: () => clock,
+      }),
+    ).rejects.toMatchObject({ problem: { code: "expired_token" } });
+    expect(sleeps).toEqual([30_000]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("caps slow_down back-off at the polling ceiling", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()

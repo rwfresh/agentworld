@@ -407,14 +407,16 @@ equivalent HTTP `Retry-After` header. Request-rate-limit responses emit
 `Retry-After` plus `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
 `X-RateLimit-Reset`. `detail` is safe for humans but not stable for branching.
 
-Rule violations from the game engine map to HTTP status by code, so the same
-code never appears with different statuses:
+Rule violations from the game engine map to HTTP status by code, and the
+social endpoints use the same status for a code they share, so one code always
+has one status:
 
 | Violation code | HTTP |
 |---|---:|
+| `SELF_TARGET` (attack, hostility, block, report, trade), `INVALID_BONUS` | 400 |
 | `TRUST_REQUIRED` | 403 |
 | `PLAYER_NOT_FOUND`, `TARGET_NOT_FOUND` | 404 |
-| every other engine code: `COOLDOWN_ACTIVE`, `INSUFFICIENT_RESOURCES`, `TILE_OCCUPIED`, `OUT_OF_BOUNDS`, `BUILD_LOCATION_INVALID`, `CONSTRUCTION_LIMIT_REACHED`, `STRUCTURE_TYPE_INVALID`, `CONSTRUCTION_NOT_READY`, `NOT_STRUCTURE_OWNER`, `HOSTILITY_NOT_FOUND`, `HOSTILITY_NOT_ACTIVE`, `HOSTILITY_WARMUP`, `ALREADY_HOSTILE`, `TARGET_NOT_ADJACENT`, `SAFE_ZONE`, `ALLIED_TARGET`, `SELF_TARGET`, `INVALID_BONUS`, `TARGET_DESTROYED` | 409 |
+| every other engine code: `COOLDOWN_ACTIVE`, `INSUFFICIENT_RESOURCES`, `TILE_OCCUPIED`, `OUT_OF_BOUNDS`, `BUILD_LOCATION_INVALID`, `CONSTRUCTION_LIMIT_REACHED`, `STRUCTURE_TYPE_INVALID`, `CONSTRUCTION_NOT_READY`, `NOT_STRUCTURE_OWNER`, `HOSTILITY_NOT_FOUND`, `HOSTILITY_NOT_ACTIVE`, `HOSTILITY_WARMUP`, `ALREADY_HOSTILE`, `TARGET_NOT_ADJACENT`, `SAFE_ZONE`, `ALLIED_TARGET`, `TARGET_DESTROYED` | 409 |
 
 `COOLDOWN_ACTIVE` is the only rule violation marked `retryable: true`; its
 `retryAfter` is the remaining cooldown in whole seconds. Three application

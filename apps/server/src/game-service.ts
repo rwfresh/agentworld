@@ -148,6 +148,9 @@ function storedRuleset(world: { readonly ruleset: Json }): Ruleset {
 
 /** One HTTP status per engine violation code; TRUST_REQUIRED matches the requireTrustTier pre-check. */
 const violationStatuses: Readonly<Partial<Record<ViolationCode, number>>> = {
+  // Malformed intent rather than a state conflict; the social service uses 400 for the same code.
+  SELF_TARGET: 400,
+  INVALID_BONUS: 400,
   TRUST_REQUIRED: 403,
   PLAYER_NOT_FOUND: 404,
   TARGET_NOT_FOUND: 404,
