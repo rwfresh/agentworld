@@ -2,8 +2,11 @@ import "./style.css";
 import {
   AuthApi,
   AuthApiError,
+  authErrorMessage,
   deviceCodeFromLocation,
   normalizeDeviceCode,
+  portalReturnUrl,
+  registrationNotice,
   safeLocalCallback,
 } from "./auth-api.ts";
 
@@ -83,6 +86,7 @@ app.innerHTML = `
           <p class="panel-index">OPERATOR IDENTITY</p>
           <h2 id="signin-title">Enter the relay</h2>
           <p id="session-copy" class="muted">Authenticate to approve CLI access and manage active sessions.</p>
+          <p id="registration-notice" class="registration-notice" role="note" hidden></p>
 
           <button id="github-button" class="github-button" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.87c-2.78.6-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.64-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.56 9.56 0 0 1 12 6.82c.85 0 1.71.12 2.51.34 1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.77c0 .27.18.58.69.48A10 10 0 0 0 12 2Z" /></svg>
@@ -97,7 +101,7 @@ app.innerHTML = `
               <input id="email" name="email" type="email" autocomplete="email" placeholder="operator@example.com" required />
               <button class="send-button" type="submit" aria-label="Send magic link">SEND <span aria-hidden="true">→</span></button>
             </div>
-            <label class="invite-label" for="invite">Invite code <span class="optional-label">(hosted beta)</span></label>
+            <label class="invite-label" for="invite">Invite code <span id="invite-hint" class="optional-label">(hosted beta)</span></label>
             <input id="invite" name="invite" autocomplete="off" placeholder="Optional invite code" />
           </form>
           <p class="terms">By continuing, you agree to play fair and keep the world interesting.</p>
@@ -146,6 +150,8 @@ const callbackURL = safeLocalCallback(
     (expectedCode ? window.location.href : null),
   window.location.origin,
 );
+// A rejected sign-up or callback returns here with `?error=<code>` instead of a generic auth page.
+const errorCallbackURL = portalReturnUrl(window.location.href, window.location.origin);
 
 function setStatus(message: string, kind: "neutral" | "error" | "success" = "neutral"): void {
   status.textContent = message;
@@ -167,6 +173,9 @@ function showSuccess(): void {
 
 if (window.location.pathname === "/authorized") showSuccess();
 
+const signInFailure = authErrorMessage(window.location.search);
+if (signInFailure) setStatus(signInFailure, "error");
+
 if (expectedCode) {
   devicePanel.hidden = false;
   const codeOutput = element<HTMLOutputElement>("#device-code");
@@ -185,7 +194,7 @@ githubButton.addEventListener("click", () => {
   setBusy(githubButton, true, "Opening GitHub…");
   setStatus("Contacting the identity relay…");
   api
-    .github(callbackURL)
+    .github(callbackURL, errorCallbackURL)
     .then((url) => window.location.assign(url))
     .catch((error: unknown) => {
       setBusy(githubButton, false, "");
@@ -203,7 +212,7 @@ emailForm.addEventListener("submit", (event) => {
   setBusy(button, true, "SENDING…");
   setStatus("Dispatching a one-time link…");
   api
-    .magicLink(email, callbackURL, inviteCode || undefined)
+    .magicLink(email, callbackURL, inviteCode || undefined, errorCallbackURL)
     .then(() => setStatus("Check your inbox. The link expires soon.", "success"))
     .catch((error: unknown) =>
       setStatus(error instanceof Error ? error.message : "Could not send the email link.", "error"),
@@ -262,12 +271,33 @@ updateClock();
 window.setInterval(updateClock, 1_000);
 
 api
+  .discovery()
+  .then((discovery) => {
+    const notice = registrationNotice(discovery?.registration);
+    if (notice) {
+      const noticeElement = element<HTMLParagraphElement>("#registration-notice");
+      noticeElement.textContent = notice;
+      noticeElement.hidden = false;
+    }
+    const inviteInput = element<HTMLInputElement>("#invite");
+    if (discovery?.registration === "invite") {
+      element<HTMLSpanElement>("#invite-hint").textContent = "(required for a new account)";
+      inviteInput.placeholder = "Required for your first sign-in";
+    } else if (discovery?.registration === "closed") {
+      element<HTMLLabelElement>(".invite-label").hidden = true;
+      inviteInput.hidden = true;
+    }
+  })
+  .catch(() => undefined);
+
+api
   .session()
   .then((session) => {
     const identity = session?.user?.name ?? session?.user?.email;
     if (!identity) return;
     element<HTMLParagraphElement>("#session-copy").textContent =
       `Signed in as ${identity}. Confirm the request below.`;
+    element<HTMLParagraphElement>("#registration-notice").hidden = true;
     githubButton.hidden = true;
     emailForm.hidden = true;
     element<HTMLDivElement>(".divider").hidden = true;

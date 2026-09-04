@@ -28,17 +28,24 @@ the measured workload needs it.
 
 This document contains both the running vertical slice and the architecture
 required for the complete beta. Today the repository runs Fastify, Better Auth,
-PostgreSQL-backed game/social services, immutable events and ledgers, and a
-durable SQL-polling worker for construction completion, trade expiry, and
-season finalization. Work is claimed with `FOR UPDATE SKIP LOCKED`. The CLI
-uses a handwritten typed client. Fastify emits privacy-allowlisted Pino JSON
-request logs and bounded-cardinality Prometheus metrics.
+PostgreSQL-backed game/social services, immutable events and ledgers (UPDATE,
+DELETE, and TRUNCATE rejected by triggers), and a durable SQL-polling worker
+that completes construction, expires trades and refunds escrow, finalizes due
+seasons (production settled through the final tick, immutable player and
+alliance rankings, archival), and seeds the next season. The server enforces
+the alliance-membership freeze and computes influence scoring. Work is claimed
+with `FOR UPDATE SKIP LOCKED`. The installation identity is a persisted UUIDv7
+row created on first seed; `INSTALLATION_NAME` is mutable metadata. Invitation
+reservations live in a dedicated table keyed by an email digest. The CLI uses a
+handwritten typed client. Fastify emits privacy-allowlisted Pino JSON request
+logs and bounded-cardinality Prometheus metrics.
 
 The API uses Valkey, when configured, for a shared coarse per-network request
 limit. Per-account/action abuse controls, caches/presence, generalized queue
-features, OpenTelemetry traces, generated clients, and automated OpenAPI/client drift
-checks are pending beta work. Sections below call those out where they affect
-runtime or operational claims.
+features, OpenTelemetry traces, generated clients, and automated OpenAPI/client
+drift checks are pending beta work. Sections below call those out where they
+affect runtime or operational claims; the final section lists deliberate
+departures from the PRD.
 
 ## System context
 
@@ -219,6 +226,15 @@ instead use application-defined UUIDv8 values derived from a stable namespace,
 ruleset, and coordinate or entity key; this makes seeding repeatable without a
 lookup registry. Both versions conform to RFC 9562, and clients must treat IDs
 as opaque strings rather than deriving meaning or ordering from them.
+
+The installation itself is identified by a UUIDv7 persisted in `installations`
+the first time the seed runs against a database; an advisory lock serializes
+concurrent first seeds so exactly one row exists. `INSTALLATION_NAME` is
+mutable display metadata: a rename updates that row and never mints a second
+installation or a second current world. World, region, tile, and starter-plot
+UUIDv8 values derive from the persisted installation id, the ruleset, and the
+season, so two operators using the default name still hold globally unique
+identifiers. Discovery (`/.well-known/agentworld`) reports the persisted id.
 Federation readiness is semantic, not an implemented protocol:
 
 - `world.home_server_id` names the installation that owns a world;
@@ -369,3 +385,39 @@ blockchain/wallets, MCP, WebSockets, server-side automation orders, research,
 units, capture/loot, a public market, executable mods, microservices, or a game
 web client. Introducing one requires revised product, security, API, and
 operational design—not merely a new dependency.
+
+## PRD deviations
+
+The beta deliberately departs from
+[`AgentWorld_PRD_v1.md`](AgentWorld_PRD_v1.md) in the following ways. Each is a
+scoped product decision for the beta, not an oversight:
+
+- **Influence sources (PRD §2).** Influence is territory, structures, economy,
+  and combat. Technology, alliances, and resource control award no influence;
+  alliance rankings aggregate member influence.
+- **`build` targets the current tile (PRD §18).** There are no `--x`/`--y`
+  coordinates; the commander moves first and builds where it stands.
+- **`research` (PRD §7) is deferred**, together with the Research Lab.
+- **Authentication providers (PRD §11).** Passkeys, Google, and Apple sign-in
+  are deferred; the beta ships GitHub OAuth and email magic links behind the
+  OAuth device flow.
+- **Hosting (PRD §27).** Terraform is replaced by a Render Blueprint
+  (`infra/render/render.yaml`); Docker Compose remains the local stack.
+- **Regions (PRD §6, §15, §21).** `regions` rows and `authority_server_id` are
+  modelled and seeded, but no game logic reads them; all authority is the local
+  installation.
+- **Rejected actions leave no immutable record (PRD §15).** Only accepted
+  mutations append events; rule rejections return a problem response and are
+  visible only in request logs and metrics.
+- **Game metrics (PRD §29).** Active players, actions per second, failed
+  actions, queue depth, signup rate, resource creation/destruction, and
+  suspected Sybil behaviour are not yet emitted; the API exports bounded HTTP
+  and Node runtime metrics only.
+- **Building outside the starter reserve needs no adjacency**, and the reserve
+  outside a player's own plot is not buildable. The PRD leaves placement rules
+  open; this is the beta rule.
+- **Passive production settles in non-lossy 24-hour chunks.** One settlement
+  considers at most 86,400 ticks, but repeated settlement continues from the
+  cursor so older production is never discarded.
+- **Installation identity is a persisted UUID**, not a value derived from
+  `INSTALLATION_NAME` (see "Identity and future federation").

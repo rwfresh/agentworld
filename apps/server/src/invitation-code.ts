@@ -18,6 +18,11 @@ export function invitationHash(code: string): string {
   return createHash("sha256").update(normalizeInvitationCode(code)).digest("hex");
 }
 
+/** Reservation lookups key on this digest so the address itself never reaches durable storage. */
+export function emailHash(email: string): string {
+  return createHash("sha256").update(normalizeEmail(email)).digest("hex");
+}
+
 export function generateInvitationCode(random: RandomBytes = randomBytes): string {
   const bytes = random(INVITATION_RANDOM_BYTES);
   if (bytes.length !== INVITATION_RANDOM_BYTES) {

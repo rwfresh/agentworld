@@ -301,6 +301,15 @@ export interface InvitationsTable {
   revokedAt: Timestamp | null;
 }
 
+export interface InvitationReservationsTable {
+  id: string;
+  invitationId: string;
+  /** SHA-256 hex digest of the normalized email; the plaintext address is never persisted here. */
+  emailHash: string;
+  reservedAt: Generated<Timestamp>;
+  expiresAt: Timestamp;
+}
+
 export interface SecurityAuditTable {
   id: string;
   actorUserId: string | null;
@@ -371,6 +380,7 @@ export interface Database {
   reports: ReportsTable;
   trades: TradesTable;
   invitations: InvitationsTable;
+  invitationReservations: InvitationReservationsTable;
   securityAudit: SecurityAuditTable;
   seasonFinalizations: SeasonFinalizationsTable;
   seasonPlayerRankings: SeasonPlayerRankingsTable;
@@ -385,6 +395,8 @@ export type Inventory = Selectable<InventoriesTable>;
 export type Structure = Selectable<StructuresTable>;
 export type Tile = Selectable<TilesTable>;
 export type Trade = Selectable<TradesTable>;
+export type Invitation = Selectable<InvitationsTable>;
+export type InvitationReservation = Selectable<InvitationReservationsTable>;
 export type Event = Selectable<EventsTable>;
 export type SeasonFinalization = Selectable<SeasonFinalizationsTable>;
 export type SeasonPlayerRanking = Selectable<SeasonPlayerRankingsTable>;

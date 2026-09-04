@@ -42,7 +42,8 @@ auth/security signals, and moderation decisions are secret.
 The repository currently implements a useful security core: strict route
 schemas and scope checks, world-scoped relational constraints, PostgreSQL
 transactions and idempotency receipts for implemented mutations, immutable
-game events/resource ledgers and final ranking snapshots, restart-safe SQL
+game events/resource ledgers (UPDATE, DELETE, and TRUNCATE rejected by
+database triggers) and final ranking snapshots, restart-safe SQL
 worker paths using `FOR UPDATE SKIP LOCKED`, Better Auth device authorization,
 safe human/JSON CLI rendering, a non-root production image, and basic CI
 checks.
@@ -149,9 +150,16 @@ session fixation, excessive scope, development-auth exposure.
 - Current: operator-issued invitation values carry 120 bits of randomness and
   are stored only as SHA-256 hashes with bounded expiry and use counts. A
   successful first-time magic-link request atomically consumes a use and binds
-  a 24-hour reservation to the normalized email. Revocation stops new
-  reservations; already issued 10-minute links require closing registration
-  for immediate containment. Invite-specific attempt limits remain pending.
+  a 24-hour reservation to the SHA-256 digest of the normalized email in the
+  dedicated `invitation_reservations` table; the `security_audit` row
+  references the invitation and reservation IDs only, never the address. Every
+  sign-up path, including first-time GitHub OAuth, passes through the
+  fail-closed `user.create.before` gate, which rejects with the explicit codes
+  `INVITATION_REQUIRED` or `REGISTRATION_CLOSED`; the portal reads the
+  installation's `registration` mode and explains the required email-link
+  path. Revocation stops new reservations; already issued 10-minute links
+  require closing registration for immediate containment. Invite-specific
+  attempt limits remain pending.
 
 Residual risk: malware or a malicious AI tool can use credentials available to
 that local user. Narrow scopes, session revocation, and visible approval reduce
@@ -230,10 +238,12 @@ automation at abusive rates, denial of fair access.
 
 Device/network signals are probabilistic and sensitive. Minimize retention,
 restrict access, document operator use, and avoid treating shared networks as
-proof of abuse. Shared coarse rate limits, action trust gates, alliance
-caps/freezes, combat reward caps, and player block/mute/report workflows are
-implemented. Per-signal defenses, operator review tooling, world bans, and kill
-switches remain incomplete.
+proof of abuse. Implemented today: the shared coarse per-network request limit,
+bound starter resources, trust-tier action gates, the 20-member alliance cap and
+72-hour pre-cutoff membership freeze, the per-opponent combat reward window cap,
+account suspension enforced on mutations, and player block/mute/report
+workflows. Not implemented yet: per-signal defenses, cross-account economic
+analysis, operator review tooling, world bans, and kill switches.
 
 ### Prompt and terminal injection
 
@@ -294,6 +304,10 @@ operator access, inability to erase mutable personal content.
 
 - Three domains: immutable game/economic events; restricted security/operator
   audit; deletable/tombstonable messages, reports, email, and PII.
+- Current: invitation reservations store only the SHA-256 digest of the
+  normalized email, and the related security-audit rows reference invitation
+  and reservation IDs. Database triggers reject UPDATE, DELETE, and TRUNCATE on
+  the game event and resource-ledger journals.
 - Event payload allowlists—not denylist redaction—and tests proving arbitrary
   player strings cannot enter immutable storage.
 - Current Fastify/Pino request serialization allowlists only the method; request

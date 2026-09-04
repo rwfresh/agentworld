@@ -79,7 +79,8 @@ on an absent or unsafe required value.
 |---|---|---|
 | `NODE_ENV` | yes | `production` |
 | `HOST` / `PORT` | yes | `0.0.0.0` and platform-provided port |
-| `DATABASE_URL` | yes | Internal TLS-capable PostgreSQL connection; least privilege |
+| `DATABASE_URL` | yes | Internal TLS-capable PostgreSQL 15+ connection; least privilege. Production fails startup without it; outside production an absent value falls back to the local Compose connection string |
+| `DATABASE_POOL_SIZE` | optional | Positive integer maximum of pooled connections per process (default 10); any other value fails startup |
 | `REDIS_URL` | hosted/multi-replica | Shared request-rate-limit store; omission falls back to per-process counters |
 | `BASE_URL` | yes | Exact public HTTPS origin; no path/trailing ambiguity |
 | `AUTH_SECRET` | yes | Unique random 256-bit value; shared by API/worker, secret store only |
@@ -94,6 +95,12 @@ on an absent or unsafe required value.
 Do not store secrets in `.env.example`, Compose, the Render Blueprint, logs, or
 the repository. `BASE_URL`, OAuth callbacks, cookie security, proxy trust, and
 TLS must be reviewed together whenever a domain changes.
+
+PostgreSQL 15 is the minimum supported server version because migration `002`
+uses `ON DELETE SET NULL (column_list)`; the Compose stack and Render Blueprint
+provision PostgreSQL 18. Size `DATABASE_POOL_SIZE` per process so API replicas,
+the worker, migrations, and operator sessions together stay under the server's
+connection limit.
 
 Gameplay balance is not ordinary environment configuration. The document at
 `RULESET_PATH` is validated, normalized, persisted, and hashed when a world is
@@ -131,14 +138,27 @@ secret-transfer tool; it cannot be recovered from PostgreSQL. Do not put a code
 in shell arguments, environment variables, tickets, chat logs, or application
 logs.
 
-A new email supplies the code in the auth portal. A valid request consumes one
-use and reserves that invitation for the normalized email for 24 hours; repeat
-magic-link requests for the same email during that window do not consume
-another use. Email delivery failure can therefore consume a use. Existing
-accounts do not need a code, and `REGISTRATION_MODE=closed` rejects all new
-accounts. Setting `revoked_at` stops new reservations, but an already issued
-10-minute magic link can remain valid; switch registration to `closed` when
-immediate containment is required.
+A new email supplies the code in the auth portal together with the magic-link
+request. A valid request consumes one use and reserves that invitation for the
+normalized email for 24 hours in `invitation_reservations`, which stores only
+the SHA-256 digest of the address. The matching `security_audit` row
+(`invitation_reserved`) references the invitation and reservation IDs, never the
+email. Repeat magic-link requests for the same email during that window do not
+consume another use; after the window a new request consumes one again. Email
+delivery failure can therefore consume a use. Existing accounts do not need a
+code, and `REGISTRATION_MODE=closed` rejects all new accounts. Setting
+`revoked_at` stops new reservations, but an already issued 10-minute magic link
+can remain valid; switch registration to `closed` when immediate containment is
+required.
+
+Account creation is gated in Better Auth's `user.create.before` hook for every
+sign-up path, so a first-time GitHub sign-in on an `invite` installation is
+rejected with `INVITATION_REQUIRED` (or `REGISTRATION_CLOSED`) and the browser
+returns to the portal carrying that code. The portal reads `registration` from
+`/.well-known/agentworld` and tells new operators to request the email link with
+their invite code first; GitHub sign-in works once the account exists. Expired
+reservation rows carry no personal data and may be purged as routine
+maintenance.
 
 ## Hosted deployment (Render)
 
@@ -418,10 +438,15 @@ implemented.
 
 ## Season operations
 
-The server enforces the alliance freeze and the worker implements atomic,
-restart-safe season finalization. A hosted launch still requires representative
-load, multiworker, backup/restore, and failure-injection rehearsal against the
-release candidate.
+Implemented today: the cutoff check rejects mutations once `ends_at` passes; the
+server enforces the 72-hour alliance-membership freeze; the worker finalizes one
+due world per transaction (completing cutoff-eligible construction, settling
+production through the final tick, expiring open trades and refunding escrow,
+writing immutable player and alliance rankings, and archiving the world) and
+then seeds the next season for the persisted installation id with a new
+HMAC-derived seed. Not implemented yet: operator kill switches, per-action
+pause, job and economy telemetry, and the representative load, multi-worker,
+backup/restore, and failure-injection rehearsals that a hosted launch requires.
 
 ### Before a season
 

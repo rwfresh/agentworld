@@ -56,6 +56,12 @@ Mailpit is available at <http://localhost:8025>. PostgreSQL and Valkey are
 published on `localhost:5432` and `localhost:6379` for local tooling. Change
 the development passwords in `.env` before using a shared machine.
 
+Self-hosting requires PostgreSQL 15 or newer: the checked-in migrations use
+`ON DELETE SET NULL (column_list)` foreign-key actions, which older servers
+reject. Compose and the Render Blueprint provision PostgreSQL 18. Production
+processes refuse to start without an explicit `DATABASE_URL`; the local Compose
+connection string is a development-only fallback.
+
 For a host-native development loop:
 
 ```console

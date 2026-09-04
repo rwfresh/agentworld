@@ -1,7 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import { createDatabase, type Json } from "@agentworld/db";
+import { createDatabase, type Database, type Json } from "@agentworld/db";
 import {
   type BETA_V1_RULESET,
   worldId as brandedWorldId,
@@ -10,7 +10,8 @@ import {
   generateWorldTiles,
   starterPlotForSlot,
 } from "@agentworld/game-rules";
-import { sql } from "kysely";
+import { type Kysely, sql } from "kysely";
+import { v7 as uuidv7 } from "uuid";
 
 import { type AppConfig, readConfig } from "./config.ts";
 import { loadRuleset } from "./ruleset-loader.ts";
@@ -23,6 +24,12 @@ export interface SeedSummary {
   readonly regions: number;
   readonly starterPlots: number;
   readonly tiles: number;
+}
+
+export interface InstallationIdentity {
+  readonly id: string;
+  readonly name: string;
+  readonly change: "create" | "rename" | "keep";
 }
 
 interface RegionSeedRow {
@@ -41,6 +48,19 @@ interface StarterPlotSeedRow {
   readonly originY: number;
   readonly playerId: null;
   readonly allocatedAt: null;
+}
+
+interface CurrentWorld {
+  readonly id: string;
+  readonly seasonNumber: number;
+  readonly startsAt: Date;
+  readonly endsAt: Date;
+}
+
+interface SeedContext {
+  readonly installationId: string;
+  readonly currentWorld: CurrentWorld | undefined;
+  readonly latestSeason: number;
 }
 
 function stableId(kind: string, ...parts: readonly (number | string)[]): string {
@@ -62,6 +82,36 @@ export function deriveSeasonSeed(
   return createHmac("sha256", secret)
     .update(`agentworld:world-seed:${installationId}:${worldId}:${seasonNumber}:${rulesetId}`)
     .digest("hex");
+}
+
+/**
+ * The installation id is persisted state created once per database, never derived from
+ * `INSTALLATION_NAME`: a derived id would collide across operators using the default name and
+ * would turn a rename into a second installation with a second current world. The name is
+ * mutable metadata that follows configuration.
+ */
+export function resolveInstallationIdentity(
+  existing: { readonly id: string; readonly name: string } | undefined,
+  configuredName: string,
+  newId: () => string = uuidv7,
+): InstallationIdentity {
+  if (existing === undefined) return { id: newId(), name: configuredName, change: "create" };
+  if (existing.name !== configuredName) {
+    return { id: existing.id, name: configuredName, change: "rename" };
+  }
+  return { id: existing.id, name: existing.name, change: "keep" };
+}
+
+/** Wall-clock scheduling needs an exact season length; a ruleset that would round is rejected. */
+export function seasonDurationMilliseconds(ruleset: {
+  readonly ticksPerSecond: number;
+  readonly season: { readonly durationTicks: number };
+}): number {
+  const milliseconds = (ruleset.season.durationTicks * 1_000) / ruleset.ticksPerSecond;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0) {
+    throw new Error("ruleset season duration is not exactly representable in milliseconds");
+  }
+  return milliseconds;
 }
 
 function normalizedJson(value: unknown): Json {
@@ -100,47 +150,80 @@ function batches<Value>(values: readonly Value[], size: number): readonly Value[
   return result;
 }
 
+async function ensureInstallation(
+  database: Kysely<Database>,
+  configuredName: string,
+): Promise<string> {
+  return database.transaction().execute(async (transaction) => {
+    // Serialize concurrent first seeds (API pre-deploy hook and worker) so exactly one row exists.
+    await sql`select pg_advisory_xact_lock(hashtextextended('agentworld:installation', 0))`.execute(
+      transaction,
+    );
+    const existing = await transaction
+      .selectFrom("installations")
+      .select(["id", "name"])
+      .orderBy("createdAt")
+      .orderBy("id")
+      .limit(1)
+      .executeTakeFirst();
+    const identity = resolveInstallationIdentity(existing, configuredName);
+    if (identity.change === "create") {
+      await transaction
+        .insertInto("installations")
+        .values({ id: identity.id, name: identity.name })
+        .execute();
+    } else if (identity.change === "rename") {
+      await transaction
+        .updateTable("installations")
+        .set({ name: identity.name })
+        .where("id", "=", identity.id)
+        .execute();
+    }
+    return identity.id;
+  });
+}
+
+async function loadSeedContext(
+  database: Kysely<Database>,
+  configuredName: string,
+): Promise<SeedContext> {
+  const installationId = await ensureInstallation(database, configuredName);
+  const [current, latest] = await Promise.all([
+    database
+      .selectFrom("worlds")
+      .select(["id", "seasonNumber", "startsAt", "endsAt"])
+      .where("homeServerId", "=", installationId)
+      .where("state", "in", ["scheduled", "active", "finalizing"])
+      .orderBy("seasonNumber", "desc")
+      .executeTakeFirst(),
+    database
+      .selectFrom("worlds")
+      .select("seasonNumber")
+      .where("homeServerId", "=", installationId)
+      .orderBy("seasonNumber", "desc")
+      .executeTakeFirst(),
+  ]);
+  return {
+    installationId,
+    currentWorld: current
+      ? { ...current, startsAt: new Date(current.startsAt), endsAt: new Date(current.endsAt) }
+      : undefined,
+    latestSeason: latest?.seasonNumber ?? 0,
+  };
+}
+
 export async function seedBetaWorld(config: AppConfig = readConfig()): Promise<SeedSummary> {
   const selectedRuleset = await loadRuleset(config.rulesetPath);
-  const installationId = stableId("installation", config.installationName);
+  const seasonDuration = seasonDurationMilliseconds(selectedRuleset);
   const database = createDatabase(config.databaseUrl);
-  let currentWorld:
-    | {
-        readonly id: string;
-        readonly seasonNumber: number;
-        readonly startsAt: Date;
-        readonly endsAt: Date;
-      }
-    | undefined;
-  let latestSeason = 0;
+  let context: SeedContext;
   try {
-    const [current, latest] = await Promise.all([
-      database
-        .selectFrom("worlds")
-        .select(["id", "seasonNumber", "startsAt", "endsAt"])
-        .where("homeServerId", "=", installationId)
-        .where("state", "in", ["scheduled", "active", "finalizing"])
-        .orderBy("seasonNumber", "desc")
-        .executeTakeFirst(),
-      database
-        .selectFrom("worlds")
-        .select("seasonNumber")
-        .where("homeServerId", "=", installationId)
-        .orderBy("seasonNumber", "desc")
-        .executeTakeFirst(),
-    ]);
-    currentWorld = current
-      ? {
-          ...current,
-          startsAt: new Date(current.startsAt),
-          endsAt: new Date(current.endsAt),
-        }
-      : undefined;
-    latestSeason = latest?.seasonNumber ?? 0;
+    context = await loadSeedContext(database, config.installationName);
   } catch (error) {
     await database.destroy();
     throw error;
   }
+  const { installationId, currentWorld, latestSeason } = context;
   const seasonNumber = currentWorld?.seasonNumber ?? latestSeason + 1;
   const seededWorldId = stableId("world", installationId, selectedRuleset.id, seasonNumber);
   if (currentWorld && currentWorld.id !== seededWorldId) {
@@ -157,12 +240,7 @@ export async function seedBetaWorld(config: AppConfig = readConfig()): Promise<S
   const ruleset = rulesetDocument(selectedRuleset);
   const descriptor = createWorldDescriptor(brandedWorldId(seededWorldId), seed, selectedRuleset);
   const startsAt = currentWorld?.startsAt ?? new Date(Math.floor(Date.now() / 1_000) * 1_000);
-  const endsAt =
-    currentWorld?.endsAt ??
-    new Date(
-      startsAt.getTime() +
-        (selectedRuleset.season.durationTicks / selectedRuleset.ticksPerSecond) * 1_000,
-    );
+  const endsAt = currentWorld?.endsAt ?? new Date(startsAt.getTime() + seasonDuration);
 
   const regions: RegionSeedRow[] = [];
   const regionIds = new Map<string, string>();
@@ -228,10 +306,13 @@ export async function seedBetaWorld(config: AppConfig = readConfig()): Promise<S
       .transaction()
       .setIsolationLevel("serializable")
       .execute(async (transaction): Promise<SeedSummary> => {
+        // The row already exists; this keeps the mutable name in sync and guards the FK target.
         await transaction
           .insertInto("installations")
           .values({ id: installationId, name: config.installationName })
-          .onConflict((conflict) => conflict.column("id").doNothing())
+          .onConflict((conflict) =>
+            conflict.column("id").doUpdateSet({ name: config.installationName }),
+          )
           .execute();
 
         await transaction

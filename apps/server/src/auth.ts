@@ -2,13 +2,14 @@ import { createPool } from "@agentworld/db";
 import { oauthDeviceAuthorization, oauthProvider } from "@better-auth/oauth-provider";
 import { oauthProviderResourceClient } from "@better-auth/oauth-provider/resource-client";
 import { betterAuth } from "better-auth";
+import { APIError } from "better-auth/api";
 import { fromNodeHeaders } from "better-auth/node";
 import { jwt, magicLink } from "better-auth/plugins";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import nodemailer from "nodemailer";
 import { v7 as uuidv7 } from "uuid";
-import type { AppConfig } from "./config.ts";
-import { invitationHash, normalizeEmail } from "./invitation-code.ts";
+import type { AppConfig, RegistrationMode } from "./config.ts";
+import { emailHash, invitationHash, normalizeEmail } from "./invitation-code.ts";
 import { HttpProblem } from "./problem.ts";
 
 export const gameScopes = [
@@ -31,6 +32,23 @@ export interface AuthRuntime {
   registerRoutes(app: FastifyInstance): Promise<void>;
   close(): Promise<void>;
 }
+
+export interface InvitationQueryResult {
+  readonly rows: readonly Record<string, unknown>[];
+  readonly rowCount: number | null;
+}
+
+/** The narrow slice of a `pg` pool or client that the invitation flow depends on. */
+export interface InvitationQueryRunner {
+  query(text: string, values?: readonly unknown[]): Promise<InvitationQueryResult>;
+}
+
+export interface InvitationConnectionPool extends InvitationQueryRunner {
+  connect(): Promise<InvitationQueryRunner & { release(error?: Error): void }>;
+}
+
+/** Runs as Better Auth's `user.create.before` hook; it throws instead of returning `false` so the failure reason survives. */
+export type RegistrationGate = (user: { readonly email: string }) => Promise<void>;
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -104,54 +122,118 @@ export function canonicalAuthRequestUrl(baseUrl: string, requestTarget: string):
   return url;
 }
 
-async function reserveInvitation(
-  pool: ReturnType<typeof createPool>,
+function stringField(result: InvitationQueryResult, field: string): string | undefined {
+  const value = result.rows[0]?.[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** Returns the id of an unexpired reservation for the hashed email, if one exists. */
+export async function findActiveReservation(
+  runner: InvitationQueryRunner,
+  hashedEmail: string,
+): Promise<string | undefined> {
+  const result = await runner.query(
+    `select id from public.invitation_reservations
+     where email_hash = $1 and expires_at > now()
+     order by expires_at desc limit 1`,
+    [hashedEmail],
+  );
+  return stringField(result, "id");
+}
+
+/**
+ * Consumes one invitation use and binds it to the normalized email for 24 hours. Repeated requests
+ * inside that window reuse the reservation. Only the SHA-256 email digest is stored; the audit row
+ * references the invitation and reservation, never the address.
+ */
+export async function reserveInvitation(
+  pool: InvitationConnectionPool,
   emailValue: string,
   codeValue: unknown,
 ): Promise<void> {
-  const email = normalizeEmail(emailValue);
+  const hashedEmail = emailHash(emailValue);
   if (typeof codeValue !== "string" || codeValue.trim().length < 4) {
     throw new HttpProblem(403, "INVITATION_REQUIRED", "A valid invitation code is required");
   }
   const client = await pool.connect();
+  let connectionFailure: Error | undefined;
   try {
     await client.query("begin");
     await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `agentworld-invite:${email}`,
+      `agentworld-invite:${hashedEmail}`,
     ]);
-    const existing = await client.query<{ id: string }>(
-      `select id from public.security_audit
-       where action = 'invitation_reserved' and target_type = 'email' and target_id = $1
-         and created_at > now() - interval '24 hours'
-       order by created_at desc limit 1`,
-      [email],
-    );
-    if (existing.rowCount === 0) {
-      const invitation = await client.query<{ id: string }>(
+    if ((await findActiveReservation(client, hashedEmail)) === undefined) {
+      const invitation = await client.query(
         `update public.invitations set uses = uses + 1
          where code_hash = $1 and revoked_at is null
            and (expires_at is null or expires_at > now()) and uses < max_uses
          returning id`,
         [invitationHash(codeValue)],
       );
-      const invitationId = invitation.rows[0]?.id;
-      if (!invitationId) {
+      const invitationId = stringField(invitation, "id");
+      if (invitationId === undefined) {
         throw new HttpProblem(403, "INVITATION_INVALID", "The invitation is invalid or exhausted");
       }
+      const reservation = await client.query(
+        `insert into public.invitation_reservations
+           (id, invitation_id, email_hash, reserved_at, expires_at)
+         values ($1, $2, $3, now(), now() + interval '24 hours')
+         on conflict (invitation_id, email_hash) do update
+           set reserved_at = excluded.reserved_at, expires_at = excluded.expires_at
+         returning id`,
+        [uuidv7(), invitationId, hashedEmail],
+      );
       await client.query(
         `insert into public.security_audit
            (id, actor_user_id, action, target_type, target_id, metadata)
-         values ($1, null, 'invitation_reserved', 'email', $2, $3::jsonb)`,
-        [uuidv7(), email, JSON.stringify({ invitationId })],
+         values ($1, null, 'invitation_reserved', 'invitation', $2, $3::jsonb)`,
+        [
+          uuidv7(),
+          invitationId,
+          JSON.stringify({ reservationId: stringField(reservation, "id") ?? null }),
+        ],
       );
     }
     await client.query("commit");
   } catch (error) {
-    await client.query("rollback");
+    try {
+      await client.query("rollback");
+    } catch (rollbackError) {
+      // The original failure is the actionable one; a connection that cannot roll back is discarded.
+      connectionFailure =
+        rollbackError instanceof Error ? rollbackError : new Error("rollback failed");
+    }
     throw error;
   } finally {
-    client.release();
+    client.release(connectionFailure);
   }
+}
+
+/**
+ * Fail-closed registration for every sign-up path, including first-time GitHub OAuth. Throwing a
+ * coded `APIError` makes Better Auth redirect the browser back with `error=<code>`, whereas
+ * returning `false` would surface only a generic user-creation failure.
+ */
+export function createRegistrationGate(
+  mode: RegistrationMode,
+  runner: InvitationQueryRunner,
+): RegistrationGate {
+  return async (user) => {
+    if (mode === "open") return;
+    if (mode === "closed") {
+      throw APIError.from("FORBIDDEN", {
+        code: "REGISTRATION_CLOSED",
+        message: "Registration is closed; only existing accounts can sign in",
+      });
+    }
+    if ((await findActiveReservation(runner, emailHash(user.email))) === undefined) {
+      throw APIError.from("FORBIDDEN", {
+        code: "INVITATION_REQUIRED",
+        message:
+          "First-time sign-in requires the email link with a valid invitation code; GitHub sign-in works once the account exists",
+      });
+    }
+  };
 }
 
 export function createAuthRuntime(config: AppConfig): AuthRuntime {
@@ -202,17 +284,7 @@ export function createAuthRuntime(config: AppConfig): AuthRuntime {
           databaseHooks: {
             user: {
               create: {
-                async before(user: { email: string }) {
-                  if (config.registrationMode === "closed") return false;
-                  const reservation = await authPool.query(
-                    `select id from public.security_audit
-                     where action = 'invitation_reserved' and target_type = 'email'
-                       and target_id = $1 and created_at > now() - interval '24 hours'
-                     order by created_at desc limit 1`,
-                    [normalizeEmail(user.email)],
-                  );
-                  return reservation.rowCount !== 0;
-                },
+                before: createRegistrationGate(config.registrationMode, authPool),
               },
             },
           },

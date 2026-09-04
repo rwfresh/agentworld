@@ -28,6 +28,15 @@ export interface AppConfig {
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
+const LOCAL_DATABASE_URL = "postgres://agentworld:agentworld_dev@127.0.0.1:5432/agentworld";
+
+function isOneOf<const Values extends readonly string[]>(
+  values: Values,
+  value: string,
+): value is Values[number] {
+  return values.includes(value);
+}
+
 function enumValue<const Values extends readonly string[]>(
   env: Environment,
   key: string,
@@ -35,8 +44,18 @@ function enumValue<const Values extends readonly string[]>(
   fallback: Values[number],
 ): Values[number] {
   const value = env[key] ?? fallback;
-  if (!values.includes(value)) throw new Error(`${key} must be one of: ${values.join(", ")}`);
+  if (!isOneOf(values, value)) throw new Error(`${key} must be one of: ${values.join(", ")}`);
   return value;
+}
+
+/** The Compose development credentials must never be reachable from a production process. */
+function databaseUrl(value: string | undefined, nodeEnv: AppConfig["nodeEnv"]): string {
+  const trimmed = value?.trim();
+  if (trimmed) return trimmed;
+  if (nodeEnv === "production") {
+    throw new Error("DATABASE_URL is required in production; no development fallback is applied");
+  }
+  return LOCAL_DATABASE_URL;
 }
 
 function portValue(value: string | undefined): number {
@@ -125,8 +144,7 @@ export function readConfig(env: Environment = process.env): AppConfig {
     host,
     port: portValue(env.PORT),
     trustProxyHops: trustProxyHops(env.TRUST_PROXY_HOPS),
-    databaseUrl:
-      env.DATABASE_URL ?? "postgres://agentworld:agentworld_dev@127.0.0.1:5432/agentworld",
+    databaseUrl: databaseUrl(env.DATABASE_URL, nodeEnv),
     ...(env.REDIS_URL ? { redisUrl: normalizedUrl(env.REDIS_URL, "REDIS_URL") } : {}),
     baseUrl,
     installationName: env.INSTALLATION_NAME ?? "Local AgentWorld",
