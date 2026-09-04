@@ -103,7 +103,7 @@ export function checkedAdd(left: number, right: number, label: string): number {
 }
 
 function rulesetFrom(value: Json): Ruleset {
-  return assertValidRuleset(value as unknown as Ruleset);
+  return assertValidRuleset(value);
 }
 
 function structureType(value: string): StructureType {

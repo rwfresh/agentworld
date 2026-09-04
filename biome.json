@@ -14,7 +14,8 @@
       "!!**/coverage",
       "!!**/node_modules",
       "!!**/generated",
-      "!!pnpm-lock.yaml"
+      "!!pnpm-lock.yaml",
+      "!!**/.claude"
     ]
   },
   "formatter": {
