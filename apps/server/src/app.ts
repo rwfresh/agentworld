@@ -19,6 +19,7 @@ import { createApiMetrics } from "./metrics.ts";
 import { HttpProblem, sendProblem } from "./problem.ts";
 import { registerGameRoutes } from "./routes.ts";
 import { SocialService } from "./social-service.ts";
+import { isRetryableTransactionError } from "./transaction.ts";
 
 export interface AppDependencies {
   readonly config: AppConfig;
@@ -92,6 +93,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     await rateLimitRedis.connect();
   }
 
+  // Hooks must precede every plugin and route registration: an encapsulated plugin context copies
+  // the parent's hooks when it is created, so a hook added later would miss its routes.
+  app.addHook("onResponse", async (request, reply) => {
+    metrics.observeHttp({
+      method: request.method,
+      route: request.routeOptions.url ?? "unmatched",
+      statusCode: reply.statusCode,
+      durationSeconds: reply.elapsedTime / 1_000,
+    });
+  });
+  app.addHook("onSend", async (request, reply, payload) => {
+    reply.header("x-request-id", request.id);
+    return payload;
+  });
+
   app.addContentTypeParser(
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
@@ -154,15 +170,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   if (dependencies.config.nodeEnv !== "production") {
     await app.register(swaggerUi, { routePrefix: "/documentation" });
   }
-
-  app.addHook("onResponse", async (request, reply) => {
-    metrics.observeHttp({
-      method: request.method,
-      route: request.routeOptions.url ?? "unmatched",
-      statusCode: reply.statusCode,
-      durationSeconds: reply.elapsedTime / 1_000,
-    });
-  });
 
   app.get("/health", { config: { rateLimit: false } }, async () => ({ status: "ok" }));
   app.get("/metrics", { config: { rateLimit: false } }, async (request, reply) => {
@@ -259,10 +266,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     }
   }
 
-  app.addHook("onSend", async (request, reply, payload) => {
-    reply.header("x-request-id", request.id);
-    return payload;
-  });
   app.setNotFoundHandler((request, reply) =>
     sendProblem(reply, new HttpProblem(404, "NOT_FOUND", "Route not found"), request.id),
   );
@@ -285,6 +288,20 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       return sendProblem(
         reply,
         new HttpProblem(409, "CONFLICT", "The requested state already exists"),
+        request.id,
+      );
+    }
+    if (isRetryableTransactionError(error)) {
+      // Nothing was written: the bounded in-process retry gave up on a serialization conflict.
+      return sendProblem(
+        reply,
+        new HttpProblem(
+          409,
+          "CONCURRENT_MODIFICATION",
+          "A concurrent change prevented this request from committing; retry it",
+          true,
+          1,
+        ),
         request.id,
       );
     }

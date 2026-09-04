@@ -14,7 +14,7 @@ import type {
 import type { Database, Json } from "@agentworld/db";
 import {
   type AllianceId,
-  BETA_V1_RULESET,
+  assertValidRuleset,
   type CivilizationState,
   coordinate,
   coordinateKey,
@@ -44,6 +44,7 @@ import {
   tick,
   tileAt,
   trustTierAt,
+  type ViolationCode,
   type WorldDescriptor,
   worldId,
 } from "@agentworld/game-rules";
@@ -52,6 +53,7 @@ import { sql } from "kysely";
 import { v7 as uuidv7 } from "uuid";
 import type { AppConfig } from "./config.ts";
 import { HttpProblem } from "./problem.ts";
+import { runSerializable } from "./transaction.ts";
 
 type Db = Kysely<Database> | Transaction<Database>;
 
@@ -138,15 +140,38 @@ async function nextAggregateVersion(
   return version;
 }
 
-function tickAt(startsAt: Date | string, endsAt: Date | string, now: Date): Tick {
+type TickRate = Pick<Ruleset, "ticksPerSecond">;
+
+/** Clamp an instant into the season window and convert it to the whole tick it falls in. */
+function tickAt(startsAt: Date | string, endsAt: Date | string, rate: TickRate, now: Date): Tick {
   const start = date(startsAt).getTime();
   const end = date(endsAt).getTime();
   const captured = Math.min(Math.max(now.getTime(), start), end);
-  return tick(Math.floor((captured - start) / 1_000));
+  return tick(Math.floor(((captured - start) * rate.ticksPerSecond) / 1_000));
 }
 
-function dateAtTick(startsAt: Date | string, value: number): Date {
-  return new Date(date(startsAt).getTime() + value * 1_000);
+/**
+ * Inverse of tickAt. Rounding up keeps tickAt(dateAtTick(t)) === t for every integer rate and is
+ * exact whenever a tick spans whole milliseconds, as in beta-v1's one tick per second.
+ */
+function dateAtTick(startsAt: Date | string, rate: TickRate, value: number): Date {
+  return new Date(date(startsAt).getTime() + Math.ceil((value * 1_000) / rate.ticksPerSecond));
+}
+
+/** Worlds persist their normalized ruleset; a corrupted row must fail loudly, never fall back. */
+function storedRuleset(world: { readonly ruleset: Json }): Ruleset {
+  return assertValidRuleset(world.ruleset as unknown as Ruleset);
+}
+
+/** One HTTP status per engine violation code; TRUST_REQUIRED matches the requireTrustTier pre-check. */
+const violationStatuses: Readonly<Partial<Record<ViolationCode, number>>> = {
+  TRUST_REQUIRED: 403,
+  PLAYER_NOT_FOUND: 404,
+  TARGET_NOT_FOUND: 404,
+};
+
+function violationStatus(code: ViolationCode): number {
+  return violationStatuses[code] ?? 409;
 }
 
 function resourcesWire(value: {
@@ -241,171 +266,186 @@ export class GameService {
         "Player name must contain 2 to 40 characters",
       );
     }
-    return this.database
-      .transaction()
-      .setIsolationLevel("serializable")
-      .execute(async (transaction) => {
-        const world = await this.requireMutableWorld(transaction, worldIdValue);
-        await sql`select pg_advisory_xact_lock(hashtextextended(${`${userIdValue}:spawn`}, 0))`.execute(
-          transaction,
-        );
-        let civilization = await transaction
-          .selectFrom("civilizations")
-          .selectAll()
-          .where("userId", "=", userIdValue)
-          .executeTakeFirst();
-        if (civilization?.suspendedAt) {
-          throw new HttpProblem(403, "ACCOUNT_SUSPENDED", "This civilization is suspended");
-        }
-        const existing = civilization
-          ? await transaction
-              .selectFrom("players")
-              .selectAll()
-              .where("worldId", "=", world.id)
-              .where("civilizationId", "=", civilization.id)
-              .executeTakeFirst()
-          : undefined;
-        if (existing && civilization) {
-          const replay = await transaction
-            .selectFrom("actions")
-            .select(["actionType", "requestHash", "state", "response"])
+    // Re-entrant under retry: identifiers are generated per attempt and every write is transactional.
+    return runSerializable(this.database, async (transaction) => {
+      const world = await this.requireMutableWorld(transaction, worldIdValue);
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`${userIdValue}:spawn`}, 0))`.execute(
+        transaction,
+      );
+      let civilization = await transaction
+        .selectFrom("civilizations")
+        .selectAll()
+        .where("userId", "=", userIdValue)
+        .executeTakeFirst();
+      if (civilization?.suspendedAt) {
+        throw new HttpProblem(403, "ACCOUNT_SUSPENDED", "This civilization is suspended");
+      }
+      const existing = civilization
+        ? await transaction
+            .selectFrom("players")
+            .selectAll()
             .where("worldId", "=", world.id)
-            .where("playerId", "=", existing.id)
-            .where("idempotencyKey", "=", idempotencyKey)
-            .executeTakeFirst();
-          if (replay) {
-            if (replay.actionType !== "spawn" || replay.requestHash !== hash) {
-              throw new HttpProblem(
-                409,
-                "IDEMPOTENCY_KEY_REUSED",
-                "This idempotency key was used for different input",
-              );
-            }
-            if (replay.state === "completed" && replay.response) {
-              return replay.response as PlayerSummary;
-            }
-            throw new HttpProblem(409, "ACTION_IN_PROGRESS", "Spawn is still processing", true, 1);
-          }
-          throw new HttpProblem(
-            409,
-            "PLAYER_ALREADY_EXISTS",
-            "This account already has a player in the world",
-          );
-        }
-        if (!civilization) {
-          const civilizationId = this.newId();
-          civilization = await transaction
-            .insertInto("civilizations")
-            .values({
-              id: civilizationId,
-              userId: userIdValue,
-              name,
-              suspendedAt: null,
-            })
-            .returningAll()
-            .executeTakeFirstOrThrow();
-        }
-        const plot = await transaction
-          .selectFrom("starterPlots")
-          .selectAll()
+            .where("civilizationId", "=", civilization.id)
+            .executeTakeFirst()
+        : undefined;
+      if (existing && civilization) {
+        const replay = await transaction
+          .selectFrom("actions")
+          .select(["actionType", "requestHash", "state", "response"])
           .where("worldId", "=", world.id)
-          .where("playerId", "is", null)
-          .orderBy("plotIndex")
-          .forUpdate()
-          .skipLocked()
+          .where("playerId", "=", existing.id)
+          .where("idempotencyKey", "=", idempotencyKey)
           .executeTakeFirst();
-        if (!plot)
-          throw new HttpProblem(409, "WORLD_FULL", "No starter plots remain in this world");
-
-        const ruleset = world.ruleset as unknown as Ruleset;
-        const descriptor = createWorldDescriptor(worldId(world.id), world.seed, ruleset);
-        const id = playerId(this.newId());
-        const effectiveTick = tickAt(world.startsAt, world.endsAt, this.now());
-        const starterPlot = starterPlotForSlot(descriptor, plot.plotIndex, ruleset, id);
-        const player = createStartingCivilization(
-          id,
-          starterPlot,
-          effectiveTick,
-          ruleset.startingResources,
-          civilization.trustTier as 0 | 1 | 2,
-        );
-        const structureIds = {
-          commandNode: structureId(this.newId()),
-          generator: structureId(this.newId()),
-          extractor: structureId(this.newId()),
-        };
-        const starterStructures = createStarterStructures(
-          id,
-          starterPlot,
-          structureIds,
-          effectiveTick,
-          ruleset,
-        );
-        const spawnedSnapshot: GameSnapshot = {
-          world: descriptor,
-          players: [player],
-          structures: starterStructures,
-          hostilities: [],
-        };
-        const initialInfluence = scorePlayer(spawnedSnapshot, id, ruleset).total;
-        await transaction
-          .insertInto("players")
-          .values({
-            id,
-            worldId: world.id,
-            civilizationId: civilization.id,
-            name,
-            positionX: player.position.x,
-            positionY: player.position.y,
-            starterPlotId: plot.id,
-            allianceId: null,
-            influence: initialInfluence,
-          })
-          .execute();
-        const capturedAt = this.now();
-        await transaction
-          .insertInto("inventories")
-          .values({
-            playerId: id,
-            worldId: world.id,
-            boundEnergy: player.inventory.bound.energy,
-            boundMaterials: player.inventory.bound.materials,
-            boundInference: player.inventory.bound.inference,
-            energy: 0,
-            materials: 0,
-            inference: 0,
-            lastSettledAt: capturedAt,
-          })
-          .execute();
-        await transaction
-          .updateTable("starterPlots")
-          .set({ playerId: id, allocatedAt: capturedAt })
-          .where("id", "=", plot.id)
-          .execute();
-        const tileRows = await transaction
-          .selectFrom("tiles")
-          .select(["id", "x", "y"])
-          .where("worldId", "=", world.id)
-          .where(
-            sql<boolean>`(${sql.ref("x")}, ${sql.ref("y")}) in (${sql.join(
-              starterPlot.tiles.map((tile) => sql`(${tile.x}, ${tile.y})`),
-            )})`,
-          )
-          .execute();
-        const tilesByCoordinate = new Map(tileRows.map((tile) => [coordinateKey(tile), tile.id]));
-        if (tilesByCoordinate.size !== starterPlot.tiles.length) {
-          throw new Error("seeded starter tiles are missing");
+        if (replay) {
+          if (replay.actionType !== "spawn" || replay.requestHash !== hash) {
+            throw new HttpProblem(
+              409,
+              "IDEMPOTENCY_KEY_REUSED",
+              "This idempotency key was used for different input",
+            );
+          }
+          if (replay.state === "completed" && replay.response) {
+            return replay.response as PlayerSummary;
+          }
+          throw new HttpProblem(409, "ACTION_IN_PROGRESS", "Spawn is still processing", true, 1);
         }
-        await transaction
-          .insertInto("discoveredTiles")
-          .values(
-            starterPlot.tiles.map((tile) => ({
-              worldId: world.id,
-              playerId: id,
-              tileId: tilesByCoordinate.get(coordinateKey(tile)) as string,
-            })),
-          )
-          .execute();
+        throw new HttpProblem(
+          409,
+          "PLAYER_ALREADY_EXISTS",
+          "This account already has a player in the world",
+        );
+      }
+      if (!civilization) {
+        const civilizationId = this.newId();
+        civilization = await transaction
+          .insertInto("civilizations")
+          .values({
+            id: civilizationId,
+            userId: userIdValue,
+            name,
+            suspendedAt: null,
+          })
+          .returningAll()
+          .executeTakeFirstOrThrow();
+      }
+      // Skip plots whose tiles already carry a live or constructing structure so one poisoned
+      // plot can never block every later registration; the unique index stays the last defense.
+      const plot = await transaction
+        .selectFrom("starterPlots")
+        .selectAll()
+        .where("worldId", "=", world.id)
+        .where("playerId", "is", null)
+        .where(({ not, exists, selectFrom }) =>
+          not(
+            exists(
+              selectFrom("tiles")
+                .innerJoin("structures", "structures.tileId", "tiles.id")
+                .select("tiles.id")
+                .whereRef("tiles.starterPlotId", "=", "starterPlots.id")
+                .where("structures.worldId", "=", world.id)
+                .where("structures.status", "in", ["constructing", "active"]),
+            ),
+          ),
+        )
+        .orderBy("plotIndex")
+        // LIMIT 1 is load-bearing: without it FOR UPDATE locks every free plot in the world, and a
+        // concurrent spawn skipping locked rows sees none and reports WORLD_FULL.
+        .limit(1)
+        .forUpdate()
+        .skipLocked()
+        .executeTakeFirst();
+      if (!plot) throw new HttpProblem(409, "WORLD_FULL", "No starter plots remain in this world");
+
+      const ruleset = storedRuleset(world);
+      const descriptor = createWorldDescriptor(worldId(world.id), world.seed, ruleset);
+      const id = playerId(this.newId());
+      const effectiveTick = tickAt(world.startsAt, world.endsAt, ruleset, this.now());
+      const starterPlot = starterPlotForSlot(descriptor, plot.plotIndex, ruleset, id);
+      const player = createStartingCivilization(
+        id,
+        starterPlot,
+        effectiveTick,
+        ruleset.startingResources,
+        civilization.trustTier as 0 | 1 | 2,
+      );
+      const structureIds = {
+        commandNode: structureId(this.newId()),
+        generator: structureId(this.newId()),
+        extractor: structureId(this.newId()),
+      };
+      const starterStructures = createStarterStructures(
+        id,
+        starterPlot,
+        structureIds,
+        effectiveTick,
+        ruleset,
+      );
+      const spawnedSnapshot: GameSnapshot = {
+        world: descriptor,
+        players: [player],
+        structures: starterStructures,
+        hostilities: [],
+      };
+      const initialInfluence = scorePlayer(spawnedSnapshot, id, ruleset).total;
+      await transaction
+        .insertInto("players")
+        .values({
+          id,
+          worldId: world.id,
+          civilizationId: civilization.id,
+          name,
+          positionX: player.position.x,
+          positionY: player.position.y,
+          starterPlotId: plot.id,
+          allianceId: null,
+          influence: initialInfluence,
+        })
+        .execute();
+      const capturedAt = this.now();
+      await transaction
+        .insertInto("inventories")
+        .values({
+          playerId: id,
+          worldId: world.id,
+          boundEnergy: player.inventory.bound.energy,
+          boundMaterials: player.inventory.bound.materials,
+          boundInference: player.inventory.bound.inference,
+          energy: 0,
+          materials: 0,
+          inference: 0,
+          lastSettledAt: capturedAt,
+        })
+        .execute();
+      await transaction
+        .updateTable("starterPlots")
+        .set({ playerId: id, allocatedAt: capturedAt })
+        .where("id", "=", plot.id)
+        .execute();
+      const tileRows = await transaction
+        .selectFrom("tiles")
+        .select(["id", "x", "y"])
+        .where("worldId", "=", world.id)
+        .where(
+          sql<boolean>`(${sql.ref("x")}, ${sql.ref("y")}) in (${sql.join(
+            starterPlot.tiles.map((tile) => sql`(${tile.x}, ${tile.y})`),
+          )})`,
+        )
+        .execute();
+      const tilesByCoordinate = new Map(tileRows.map((tile) => [coordinateKey(tile), tile.id]));
+      if (tilesByCoordinate.size !== starterPlot.tiles.length) {
+        throw new Error("seeded starter tiles are missing");
+      }
+      await transaction
+        .insertInto("discoveredTiles")
+        .values(
+          starterPlot.tiles.map((tile) => ({
+            worldId: world.id,
+            playerId: id,
+            tileId: tilesByCoordinate.get(coordinateKey(tile)) as string,
+          })),
+        )
+        .execute();
+      try {
         await transaction
           .insertInto("structures")
           .values(
@@ -425,51 +465,68 @@ export class GameService {
             })),
           )
           .execute();
-        const actionId = this.newId();
-        const response = this.playerSummary(
-          player,
-          civilization.id,
-          name,
-          effectiveTick,
-          ruleset,
-          spawnedSnapshot,
+      } catch (error) {
+        if ((error as { readonly code?: unknown }).code !== "23505") throw error;
+        // The plot gained a live structure between selection and insert; a retry is handed a
+        // different plot because the selection above now excludes this one.
+        throw new HttpProblem(
+          409,
+          "STARTER_PLOT_UNAVAILABLE",
+          "The selected starter plot is occupied; retry to be assigned another plot",
+          true,
+          1,
         );
-        await transaction
-          .insertInto("actions")
-          .values({
-            id: actionId,
-            worldId: world.id,
-            playerId: id,
-            idempotencyKey,
-            requestHash: hash,
-            actionType: "spawn",
-            state: "completed",
-            response: json(response),
-            completedAt: capturedAt,
-          })
-          .execute();
-        await transaction
-          .insertInto("resourceLedger")
-          .values({
-            id: this.newId(),
-            worldId: world.id,
-            playerId: id,
-            actionId,
-            reason: "starter_grant_bound",
-            energyDelta: player.inventory.bound.energy,
-            materialsDelta: player.inventory.bound.materials,
-            inferenceDelta: player.inventory.bound.inference,
-          })
-          .execute();
-        await this.recordPlayerEvent(transaction, world.id, id, actionId, "PLAYER_SPAWNED");
-        return response;
-      });
+      }
+      const actionId = this.newId();
+      const response = this.playerSummary(
+        player,
+        civilization.id,
+        name,
+        effectiveTick,
+        ruleset,
+        spawnedSnapshot,
+      );
+      await transaction
+        .insertInto("actions")
+        .values({
+          id: actionId,
+          worldId: world.id,
+          playerId: id,
+          idempotencyKey,
+          requestHash: hash,
+          actionType: "spawn",
+          state: "completed",
+          response: json(response),
+          completedAt: capturedAt,
+        })
+        .execute();
+      await transaction
+        .insertInto("resourceLedger")
+        .values({
+          id: this.newId(),
+          worldId: world.id,
+          playerId: id,
+          actionId,
+          reason: "starter_grant_bound",
+          energyDelta: player.inventory.bound.energy,
+          materialsDelta: player.inventory.bound.materials,
+          inferenceDelta: player.inventory.bound.inference,
+        })
+        .execute();
+      await this.recordPlayerEvent(transaction, world.id, id, actionId, "PLAYER_SPAWNED");
+      return response;
+    });
   }
 
   public async status(userIdValue: string, worldIdValue: string): Promise<PlayerStatus> {
     const actor = await this.requireActor(this.database, userIdValue, worldIdValue);
     const loaded = await this.loadGame(this.database, worldIdValue, actor.id);
-    const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, this.now());
+    const effectiveTick = tickAt(
+      loaded.dbWorld.startsAt,
+      loaded.dbWorld.endsAt,
+      loaded.ruleset,
+      this.now(),
+    );
     const projected = projectPlayerAt(
       loaded.snapshot,
       playerId(actor.id),
@@ -547,7 +604,12 @@ export class GameService {
   public async look(userIdValue: string, worldIdValue: string): Promise<LookResponse> {
     const actor = await this.requireActor(this.database, userIdValue, worldIdValue);
     const loaded = await this.loadGame(this.database, worldIdValue, actor.id);
-    const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, this.now());
+    const effectiveTick = tickAt(
+      loaded.dbWorld.startsAt,
+      loaded.dbWorld.endsAt,
+      loaded.ruleset,
+      this.now(),
+    );
     const result = look(loaded.snapshot, playerId(actor.id), loaded.ruleset);
     if (!("tiles" in result)) throw new HttpProblem(404, result.code, result.message);
     const domainActor = loaded.snapshot.players.find((candidate) => candidate.id === actor.id);
@@ -573,7 +635,12 @@ export class GameService {
       : 0;
     if (!Number.isSafeInteger(offset) || offset < 0)
       throw new HttpProblem(400, "INVALID_CURSOR", "Invalid cursor");
-    const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, this.now());
+    const effectiveTick = tickAt(
+      loaded.dbWorld.startsAt,
+      loaded.dbWorld.endsAt,
+      loaded.ruleset,
+      this.now(),
+    );
     const all = [...domainActor.discoveredTileKeys].sort((left, right) => {
       const [lx, ly] = left.split(",").map(Number);
       const [rx, ry] = right.split(",").map(Number);
@@ -605,7 +672,12 @@ export class GameService {
   public async players(userIdValue: string, worldIdValue: string) {
     const actor = await this.requireActor(this.database, userIdValue, worldIdValue);
     const loaded = await this.loadGame(this.database, worldIdValue, actor.id);
-    const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, this.now());
+    const effectiveTick = tickAt(
+      loaded.dbWorld.startsAt,
+      loaded.dbWorld.endsAt,
+      loaded.ruleset,
+      this.now(),
+    );
     const visible = look(loaded.snapshot, playerId(actor.id), loaded.ruleset);
     if (!("tiles" in visible)) throw new HttpProblem(404, visible.code, visible.message);
     const visibleKeys = new Set(visible.tiles.map((tile) => coordinateKey(tile.coordinate)));
@@ -725,7 +797,12 @@ export class GameService {
           allianceId: player.allianceId,
           influence: scorePlayer(loaded.snapshot, player.id, loaded.ruleset),
         }))
-        .sort((left, right) => right.influence.total - left.influence.total)
+        // Same tie-break as season finalization: total descending, then player id ascending.
+        .sort(
+          (left, right) =>
+            right.influence.total - left.influence.total ||
+            left.playerId.localeCompare(right.playerId),
+        )
         .map((entry, index) => ({ rank: index + 1, ...entry })),
     };
   }
@@ -739,136 +816,142 @@ export class GameService {
       );
     }
     const hash = requestHash(input.actionType, input.body);
-    return this.database
-      .transaction()
-      .setIsolationLevel("serializable")
-      .execute(async (transaction) => {
-        const actor = await this.requireActor(transaction, input.userId, input.worldId, true);
-        await this.requireMutableWorld(transaction, input.worldId);
-        await sql`select pg_advisory_xact_lock(hashtextextended(${`${actor.id}:${input.idempotencyKey}`}, 0))`.execute(
-          transaction,
-        );
-        const replay = await transaction
-          .selectFrom("actions")
-          .selectAll()
-          .where("worldId", "=", input.worldId)
-          .where("playerId", "=", actor.id)
-          .where("idempotencyKey", "=", input.idempotencyKey)
-          .executeTakeFirst();
-        if (replay) {
-          if (replay.requestHash !== hash || replay.actionType !== input.actionType) {
-            throw new HttpProblem(
-              409,
-              "IDEMPOTENCY_KEY_REUSED",
-              "This idempotency key was used for different input",
-            );
-          }
-          if (replay.state === "completed" && replay.response)
-            return replay.response as ActionReceipt;
+    // Re-entrant under retry: identifiers are generated per attempt and every write is transactional.
+    return runSerializable(this.database, async (transaction) => {
+      const actor = await this.requireActor(transaction, input.userId, input.worldId, true);
+      await this.requireMutableWorld(transaction, input.worldId);
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`${actor.id}:${input.idempotencyKey}`}, 0))`.execute(
+        transaction,
+      );
+      const replay = await transaction
+        .selectFrom("actions")
+        .selectAll()
+        .where("worldId", "=", input.worldId)
+        .where("playerId", "=", actor.id)
+        .where("idempotencyKey", "=", input.idempotencyKey)
+        .executeTakeFirst();
+      if (replay) {
+        if (replay.requestHash !== hash || replay.actionType !== input.actionType) {
           throw new HttpProblem(
             409,
-            "ACTION_IN_PROGRESS",
-            "An action with this key is still processing",
-            true,
-            1,
+            "IDEMPOTENCY_KEY_REUSED",
+            "This idempotency key was used for different input",
           );
         }
-        const actionId = this.newId();
-        await transaction
-          .insertInto("actions")
-          .values({
-            id: actionId,
-            worldId: input.worldId,
-            playerId: actor.id,
-            idempotencyKey: input.idempotencyKey,
-            requestHash: hash,
-            actionType: input.actionType,
-            state: "processing",
-            response: null,
-            completedAt: null,
-          })
-          .execute();
-        const loaded = await this.loadGame(transaction, input.worldId, actor.id);
-        if (loaded.dbWorld.state !== "active") {
-          throw new HttpProblem(409, "WORLD_NOT_ACTIVE", "The world is not active");
-        }
-        const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, this.now());
-        const generatedId = this.newId();
-        const command = input.command(actor.id, generatedId);
-        const decision = decide(command, loaded.snapshot, loaded.ruleset, effectiveTick);
-        if (!decision.ok) {
-          throw new HttpProblem(
-            decision.violation.code === "PLAYER_NOT_FOUND" ||
-              decision.violation.code === "TARGET_NOT_FOUND"
-              ? 404
-              : 409,
-            decision.violation.code,
-            decision.violation.message,
-            decision.violation.code === "COOLDOWN_ACTIVE",
-            decision.violation.retryAtTick === undefined
-              ? undefined
-              : Math.max(0, decision.violation.retryAtTick - effectiveTick),
-          );
-        }
-        const capturedAt = this.now();
-        const persistedEvents = await this.persistDecision(
-          transaction,
-          loaded,
-          decision.state,
-          decision.events,
-          actor.id,
-          actionId,
-          capturedAt,
+        if (replay.state === "completed" && replay.response)
+          return replay.response as ActionReceipt;
+        throw new HttpProblem(
+          409,
+          "ACTION_IN_PROGRESS",
+          "An action with this key is still processing",
+          true,
+          1,
         );
-        const resultActor = decision.state.players.find((candidate) => candidate.id === actor.id);
-        if (!resultActor) throw new Error("decision removed its actor");
-        const total = inventoryTotal(resultActor.inventory);
-        const scanEvent = decision.events.find(
-          (event): event is Extract<DomainEvent, { type: "AREA_SCANNED" }> =>
-            event.type === "AREA_SCANNED",
-        );
-        const scanResult =
-          scanEvent === undefined
-            ? undefined
-            : {
-                origin: scanEvent.center,
-                radius: scanEvent.radius,
-                tick: effectiveTick,
-                tiles: scanEvent.revealedTileKeys.map((key) => {
-                  const [x, y] = key.split(",").map(Number);
-                  return this.tileView(
-                    coordinate(x ?? 0, y ?? 0),
-                    { ...loaded, snapshot: decision.state },
-                    resultActor,
-                    new Set(scanEvent.revealedTileKeys),
-                    effectiveTick,
-                  );
-                }),
-              };
-        const receipt: ActionReceipt = {
-          actionId,
+      }
+      const actionId = this.newId();
+      await transaction
+        .insertInto("actions")
+        .values({
+          id: actionId,
+          worldId: input.worldId,
+          playerId: actor.id,
           idempotencyKey: input.idempotencyKey,
-          status: decision.completionTick === undefined ? "completed" : "scheduled",
-          effectiveTick,
-          ...(decision.completionTick === undefined
-            ? {}
-            : {
-                completesAt: dateAtTick(
-                  loaded.dbWorld.startsAt,
-                  decision.completionTick,
-                ).toISOString(),
+          requestHash: hash,
+          actionType: input.actionType,
+          state: "processing",
+          response: null,
+          completedAt: null,
+        })
+        .execute();
+      const loaded = await this.loadGame(transaction, input.worldId, actor.id);
+      if (loaded.dbWorld.state !== "active") {
+        throw new HttpProblem(409, "WORLD_NOT_ACTIVE", "The world is not active");
+      }
+      const effectiveTick = tickAt(
+        loaded.dbWorld.startsAt,
+        loaded.dbWorld.endsAt,
+        loaded.ruleset,
+        this.now(),
+      );
+      const generatedId = this.newId();
+      const command = input.command(actor.id, generatedId);
+      const decision = decide(command, loaded.snapshot, loaded.ruleset, effectiveTick);
+      if (!decision.ok) {
+        const { violation } = decision;
+        throw new HttpProblem(
+          violationStatus(violation.code),
+          violation.code,
+          violation.message,
+          violation.code === "COOLDOWN_ACTIVE",
+          violation.retryAtTick === undefined
+            ? undefined
+            : Math.max(
+                0,
+                Math.ceil((violation.retryAtTick - effectiveTick) / loaded.ruleset.ticksPerSecond),
+              ),
+        );
+      }
+      const capturedAt = this.now();
+      const persistedEvents = await this.persistDecision(
+        transaction,
+        loaded,
+        decision.state,
+        decision.events,
+        actor.id,
+        actionId,
+        effectiveTick,
+        capturedAt,
+      );
+      const resultActor = decision.state.players.find((candidate) => candidate.id === actor.id);
+      if (!resultActor) throw new Error("decision removed its actor");
+      const total = inventoryTotal(resultActor.inventory);
+      const scanEvent = decision.events.find(
+        (event): event is Extract<DomainEvent, { type: "AREA_SCANNED" }> =>
+          event.type === "AREA_SCANNED",
+      );
+      const scanResult =
+        scanEvent === undefined
+          ? undefined
+          : {
+              origin: scanEvent.center,
+              radius: scanEvent.radius,
+              tick: effectiveTick,
+              tiles: scanEvent.revealedTileKeys.map((key) => {
+                const [x, y] = key.split(",").map(Number);
+                return this.tileView(
+                  coordinate(x ?? 0, y ?? 0),
+                  { ...loaded, snapshot: decision.state },
+                  resultActor,
+                  new Set(scanEvent.revealedTileKeys),
+                  effectiveTick,
+                );
               }),
-          resources: resourcesWire(total),
-          ...(scanResult === undefined ? {} : { result: scanResult }),
-          events: persistedEvents,
-        };
-        await transaction
-          .updateTable("actions")
-          .set({ state: "completed", response: json(receipt), completedAt: capturedAt })
-          .where("id", "=", actionId)
-          .execute();
-        return receipt;
-      });
+            };
+      const receipt: ActionReceipt = {
+        actionId,
+        idempotencyKey: input.idempotencyKey,
+        status: decision.completionTick === undefined ? "completed" : "scheduled",
+        effectiveTick,
+        ...(decision.completionTick === undefined
+          ? {}
+          : {
+              completesAt: dateAtTick(
+                loaded.dbWorld.startsAt,
+                loaded.ruleset,
+                decision.completionTick,
+              ).toISOString(),
+            }),
+        resources: resourcesWire(total),
+        ...(scanResult === undefined ? {} : { result: scanResult }),
+        events: persistedEvents,
+      };
+      await transaction
+        .updateTable("actions")
+        .set({ state: "completed", response: json(receipt), completedAt: capturedAt })
+        .where("id", "=", actionId)
+        .execute();
+      return receipt;
+    });
   }
 
   /**
@@ -884,7 +967,12 @@ export class GameService {
   ): Promise<void> {
     const capturedAt = this.now();
     const loaded = await this.loadGame(transaction, worldIdValue, actorId);
-    const effectiveTick = tickAt(loaded.dbWorld.startsAt, loaded.dbWorld.endsAt, capturedAt);
+    const effectiveTick = tickAt(
+      loaded.dbWorld.startsAt,
+      loaded.dbWorld.endsAt,
+      loaded.ruleset,
+      capturedAt,
+    );
     const settlement = settlePassiveProduction(
       loaded.snapshot,
       playerId(actorId),
@@ -899,6 +987,7 @@ export class GameService {
       settlement.events,
       actorId,
       actionId,
+      effectiveTick,
       capturedAt,
       "passive_production",
     );
@@ -914,6 +1003,7 @@ export class GameService {
     payload: Readonly<Record<string, unknown>> = {},
   ): Promise<void> {
     const world = await this.requireWorld(transaction, worldIdValue);
+    const ruleset = storedRuleset(world);
     const aggregateVersion = await nextAggregateVersion(
       transaction,
       world.homeServerId,
@@ -932,7 +1022,7 @@ export class GameService {
         aggregateType: "action",
         aggregateId: actionId,
         aggregateVersion,
-        tick: tickAt(world.startsAt, world.endsAt, this.now()),
+        tick: tickAt(world.startsAt, world.endsAt, ruleset, this.now()),
         rulesetHash: world.rulesetHash,
         payloadVersion: 1,
         visibility: "player",
@@ -1049,11 +1139,12 @@ export class GameService {
       throw new HttpProblem(409, "WORLD_NOT_ACTIVE", "The world is not active");
     }
     if (this.now().getTime() >= date(world.endsAt).getTime()) {
+      // Not retryable: the next season is a different world id, so resending the same request here
+      // can never succeed. Clients must rediscover the current world first.
       throw new HttpProblem(
         409,
         "SEASON_TRANSITION",
-        "The season cutoff has passed; this world is now read-only",
-        true,
+        "The season cutoff has passed and this world is read-only; rediscover the current world",
       );
     }
     return world;
@@ -1076,11 +1167,16 @@ export class GameService {
     return actor;
   }
 
+  /**
+   * Enforce a trust tier from durable progress. Mutation paths persist a newly earned tier; read
+   * paths pass `persist: false` so a GET never writes.
+   */
   public async requireTrustTier(
     db: Db,
     actorId: string,
     worldIdValue: string,
     requiredTier: 1 | 2,
+    options: { readonly persist: boolean } = { persist: true },
   ): Promise<1 | 2> {
     const [progress, dbWorld] = await Promise.all([
       db
@@ -1106,11 +1202,11 @@ export class GameService {
     if (progress.suspendedAt) {
       throw new HttpProblem(403, "ACCOUNT_SUSPENDED", "This civilization is suspended");
     }
-    const ruleset = dbWorld.ruleset as unknown as Ruleset;
-    const effectiveTick = tickAt(dbWorld.startsAt, dbWorld.endsAt, this.now());
+    const ruleset = storedRuleset(dbWorld);
+    const effectiveTick = tickAt(dbWorld.startsAt, dbWorld.endsAt, ruleset, this.now());
     const currentTier = trustTierAt(
       {
-        joinedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(progress.spawnedAt)),
+        joinedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, ruleset, date(progress.spawnedAt)),
         successfulMutations: progress.successfulMutations,
         completedStructures: progress.completedStructures,
         earnedResources: resources(
@@ -1130,7 +1226,7 @@ export class GameService {
         `Trust tier ${requiredTier} is required for this action`,
       );
     }
-    if (currentTier > progress.persistentTrustTier) {
+    if (options.persist && currentTier > progress.persistentTrustTier) {
       await db
         .updateTable("civilizations")
         .set({ trustTier: currentTier })
@@ -1142,7 +1238,7 @@ export class GameService {
 
   public async assertAllianceChangesAllowed(db: Db, worldIdValue: string): Promise<void> {
     const dbWorld = await this.requireMutableWorld(db, worldIdValue);
-    const ruleset = dbWorld.ruleset as unknown as Ruleset;
+    const ruleset = storedRuleset(dbWorld);
     const freezeAt =
       date(dbWorld.endsAt).getTime() -
       (ruleset.season.allianceFreezeTicks / ruleset.ticksPerSecond) * 1_000;
@@ -1161,7 +1257,7 @@ export class GameService {
     discoveryPlayerId?: string,
   ): Promise<LoadedGame> {
     const dbWorld = await this.requireWorld(db, worldIdValue);
-    const ruleset = (dbWorld.ruleset as unknown as Ruleset) ?? BETA_V1_RULESET;
+    const ruleset = storedRuleset(dbWorld);
     const descriptor = createWorldDescriptor(worldId(dbWorld.id), dbWorld.seed, ruleset);
     const playerRows = await db
       .selectFrom("players")
@@ -1228,7 +1324,12 @@ export class GameService {
     const cooldowns = new Map<string, Record<string, Tick>>();
     for (const row of cooldownRows) {
       const duration = this.cooldownDuration(row.action, ruleset);
-      const availableTick = tickAt(dbWorld.startsAt, dbWorld.endsAt, date(row.availableAt));
+      const availableTick = tickAt(
+        dbWorld.startsAt,
+        dbWorld.endsAt,
+        ruleset,
+        date(row.availableAt),
+      );
       const current = cooldowns.get(row.playerId) ?? {};
       current[row.action] = tick(Math.max(0, availableTick - duration));
       cooldowns.set(row.playerId, current);
@@ -1265,14 +1366,14 @@ export class GameService {
           ...(cooldown.harvest === undefined ? {} : { harvestedAtTick: cooldown.harvest }),
           ...(cooldown.attack === undefined ? {} : { attackedAtTick: cooldown.attack }),
         },
-        joinedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(row.spawnedAt)),
+        joinedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, ruleset, date(row.spawnedAt)),
         successfulMutations: row.successfulMutations,
         completedStructures: row.completedStructures,
         earnedResources: resources(row.earnedEnergy, row.earnedMaterials, row.earnedInference),
         combatInfluence: row.combatInfluence,
         combatAwardWindows: (windows.get(row.id) ?? []).map((window) => ({
           opponentId: playerId(window.opponentPlayerId),
-          startedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(window.startedAt)),
+          startedAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, ruleset, date(window.startedAt)),
           influence: window.influence,
         })),
         persistentTrustTier: civilization.trustTier as 0 | 1 | 2,
@@ -1291,19 +1392,32 @@ export class GameService {
             constructionCompleteTick: tickAt(
               dbWorld.startsAt,
               dbWorld.endsAt,
+              ruleset,
               date(row.completesAt),
             ),
           }
         : {}),
-      lastProductionTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(row.lastProductionAt)),
+      lastProductionTick: tickAt(
+        dbWorld.startsAt,
+        dbWorld.endsAt,
+        ruleset,
+        date(row.lastProductionAt),
+      ),
       productionRemainderTicks: row.productionRemainderTicks,
     }));
     const hostilities: HostilityState[] = hostilityRows.map((row) => ({
       aggressorId: playerId(row.aggressorPlayerId),
       defenderId: playerId(row.defenderPlayerId),
-      declaredAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(row.declaredAt)),
+      declaredAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, ruleset, date(row.declaredAt)),
       ...(row.withdrawnAt
-        ? { withdrawnAtTick: tickAt(dbWorld.startsAt, dbWorld.endsAt, date(row.withdrawnAt)) }
+        ? {
+            withdrawnAtTick: tickAt(
+              dbWorld.startsAt,
+              dbWorld.endsAt,
+              ruleset,
+              date(row.withdrawnAt),
+            ),
+          }
         : {}),
     }));
     return {
@@ -1357,6 +1471,7 @@ export class GameService {
         : {
             completesAt: dateAtTick(
               loaded.dbWorld.startsAt,
+              loaded.ruleset,
               structure.constructionCompleteTick,
             ).toISOString(),
           }),
@@ -1410,6 +1525,7 @@ export class GameService {
     events: readonly DomainEvent[],
     actorId: string,
     actionId: string,
+    effectiveTick: Tick,
     capturedAt: Date,
     actorLedgerReason = "game_action",
   ): Promise<EventSummary[]> {
@@ -1490,6 +1606,18 @@ export class GameService {
           .execute();
       }
     }
+    // Game actions earn trust too; persist a promotion so social paths and later seasons see it.
+    const earnedTier = trustTierAt(player, effectiveTick, loaded.ruleset);
+    if (earnedTier > player.persistentTrustTier) {
+      const civilizationId = loaded.civilizationIds.get(actorId);
+      if (civilizationId === undefined) throw new Error("decision actor has no civilization");
+      await transaction
+        .updateTable("civilizations")
+        .set({ trustTier: earnedTier })
+        .where("id", "=", civilizationId)
+        .where("trustTier", "<", earnedTier)
+        .execute();
+    }
     for (const allianceId of affectedAlliances) {
       const members = await transaction
         .selectFrom("players")
@@ -1523,6 +1651,7 @@ export class GameService {
           action,
           availableAt: dateAtTick(
             loaded.dbWorld.startsAt,
+            loaded.ruleset,
             lastTick + this.cooldownDuration(action, loaded.ruleset),
           ),
         })
@@ -1579,7 +1708,7 @@ export class GameService {
       const completesAt =
         structure.constructionCompleteTick === undefined
           ? null
-          : dateAtTick(loaded.dbWorld.startsAt, structure.constructionCompleteTick);
+          : dateAtTick(loaded.dbWorld.startsAt, loaded.ruleset, structure.constructionCompleteTick);
       if (!before) {
         await transaction
           .insertInto("structures")
@@ -1595,7 +1724,11 @@ export class GameService {
             completesAt,
             activatedAt: structure.status === "active" ? capturedAt : null,
             destroyedAt: structure.status === "destroyed" ? capturedAt : null,
-            lastProductionAt: dateAtTick(loaded.dbWorld.startsAt, structure.lastProductionTick),
+            lastProductionAt: dateAtTick(
+              loaded.dbWorld.startsAt,
+              loaded.ruleset,
+              structure.lastProductionTick,
+            ),
             productionRemainderTicks: structure.productionRemainderTicks,
           })
           .execute();
@@ -1612,7 +1745,11 @@ export class GameService {
               before.status !== "destroyed" && structure.status === "destroyed"
                 ? capturedAt
                 : undefined,
-            lastProductionAt: dateAtTick(loaded.dbWorld.startsAt, structure.lastProductionTick),
+            lastProductionAt: dateAtTick(
+              loaded.dbWorld.startsAt,
+              loaded.ruleset,
+              structure.lastProductionTick,
+            ),
             productionRemainderTicks: structure.productionRemainderTicks,
             version: sql`version + 1`,
           })
@@ -1621,27 +1758,45 @@ export class GameService {
       }
     }
 
+    // Only new or changed pairs are written: rewriting every hostility in the world on every action
+    // turned unrelated concurrent mutations into serialization conflicts.
+    const previousHostilities = new Map(
+      loaded.snapshot.hostilities.map((hostility) => [
+        `${hostility.aggressorId}:${hostility.defenderId}`,
+        hostility,
+      ]),
+    );
     for (const hostility of next.hostilities) {
+      const before = previousHostilities.get(`${hostility.aggressorId}:${hostility.defenderId}`);
+      if (
+        before !== undefined &&
+        before.declaredAtTick === hostility.declaredAtTick &&
+        before.withdrawnAtTick === hostility.withdrawnAtTick
+      ) {
+        continue;
+      }
       await transaction
         .insertInto("hostilities")
         .values({
           worldId: loaded.dbWorld.id,
           aggressorPlayerId: hostility.aggressorId,
           defenderPlayerId: hostility.defenderId,
-          declaredAt: dateAtTick(loaded.dbWorld.startsAt, hostility.declaredAtTick),
+          declaredAt: dateAtTick(loaded.dbWorld.startsAt, loaded.ruleset, hostility.declaredAtTick),
           activeAt: dateAtTick(
             loaded.dbWorld.startsAt,
+            loaded.ruleset,
             hostility.declaredAtTick + loaded.ruleset.combat.hostilityWarmupTicks,
           ),
           withdrawnAt:
             hostility.withdrawnAtTick === undefined
               ? null
-              : dateAtTick(loaded.dbWorld.startsAt, hostility.withdrawnAtTick),
+              : dateAtTick(loaded.dbWorld.startsAt, loaded.ruleset, hostility.withdrawnAtTick),
           retaliationEndsAt:
             hostility.withdrawnAtTick === undefined
               ? null
               : dateAtTick(
                   loaded.dbWorld.startsAt,
+                  loaded.ruleset,
                   hostility.withdrawnAtTick + loaded.ruleset.combat.retaliationAfterWithdrawalTicks,
                 ),
         })
@@ -1664,7 +1819,7 @@ export class GameService {
           worldId: loaded.dbWorld.id,
           playerId: actorId,
           opponentPlayerId: window.opponentId,
-          startedAt: dateAtTick(loaded.dbWorld.startsAt, window.startedAtTick),
+          startedAt: dateAtTick(loaded.dbWorld.startsAt, loaded.ruleset, window.startedAtTick),
           influence: window.influence,
         })
         .onConflict((conflict) =>

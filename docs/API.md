@@ -72,10 +72,15 @@ headers needed by the client, and response body.
   transaction.
 - An identical committed replay returns the stored result and does not renew a
   cooldown, spend resources, emit events, or enqueue another job.
-- Concurrent identical requests converge on that same result.
+- Concurrent identical requests converge on that same result: the later
+  request waits on the actor's row lock, is retried transparently by the
+  server if the winner's commit invalidated its snapshot, and then replays the
+  stored receipt, so both callers receive the same `actionId`.
 - Reusing the key with different validated input returns HTTP `409` and
   `IDEMPOTENCY_KEY_REUSED`.
-- A request whose transaction never committed may be safely retried.
+- A request whose transaction never committed may be safely retried. That
+  includes `409 CONCURRENT_MODIFICATION`, which the server returns only after
+  its own bounded retry gave up; resend with the same key after `Retry-After`.
 
 Clients generate a fresh UUIDv7 key per user-intended mutation and retain it
 across network retries.
@@ -356,8 +361,10 @@ Current pagination is endpoint-specific:
   base64url-encoded numeric offset;
 - event pages default to 50, accept at most 100 in the service, sort by event
   offset ascending, and use the decimal event offset as the cursor;
-- message pages contain at most 50 newest-first items and use a base64url UTC
-  timestamp cursor; the accepted `limit` parameter is not yet applied;
+- message pages default to 50, accept `limit` 1–50 (larger values are clamped
+  to 50 by the service), sort newest first, and use a base64url UTC timestamp
+  cursor; muted channels are excluded before the limit is applied, so a page is
+  full whenever more messages exist;
 - players, leaderboard, and alliances are currently unpaginated; trades return
   at most the newest 100 without a continuation cursor.
 
@@ -385,11 +392,34 @@ small status shape documented in the runbook.
 }
 ```
 
-Temporary action conflicts may add integer `retryAfter` seconds to the body.
-Those action conflicts do not yet emit the corresponding HTTP `Retry-After`
-header. Request-rate-limit responses do emit `Retry-After` plus
-`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`.
-`detail` is safe for humans but not stable for branching.
+Temporary conflicts may add integer `retryAfter` seconds to the body, and
+whenever the body carries `retryAfter` the response also carries the
+equivalent HTTP `Retry-After` header. Request-rate-limit responses emit
+`Retry-After` plus `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
+`X-RateLimit-Reset`. `detail` is safe for humans but not stable for branching.
+
+Rule violations from the game engine map to HTTP status by code, so the same
+code never appears with different statuses:
+
+| Violation code | HTTP |
+|---|---:|
+| `TRUST_REQUIRED` | 403 |
+| `PLAYER_NOT_FOUND`, `TARGET_NOT_FOUND` | 404 |
+| every other engine code: `COOLDOWN_ACTIVE`, `INSUFFICIENT_RESOURCES`, `TILE_OCCUPIED`, `OUT_OF_BOUNDS`, `BUILD_LOCATION_INVALID`, `CONSTRUCTION_LIMIT_REACHED`, `STRUCTURE_TYPE_INVALID`, `CONSTRUCTION_NOT_READY`, `NOT_STRUCTURE_OWNER`, `HOSTILITY_NOT_FOUND`, `HOSTILITY_NOT_ACTIVE`, `HOSTILITY_WARMUP`, `ALREADY_HOSTILE`, `TARGET_NOT_ADJACENT`, `SAFE_ZONE`, `ALLIED_TARGET`, `SELF_TARGET`, `INVALID_BONUS`, `TARGET_DESTROYED` | 409 |
+
+`COOLDOWN_ACTIVE` is the only rule violation marked `retryable: true`; its
+`retryAfter` is the remaining cooldown in whole seconds. Three application
+conflicts deserve special handling:
+
+- `CONCURRENT_MODIFICATION` (409, `retryable: true`, `retryAfter: 1`): the
+  server's bounded retry of a serialization failure or deadlock was exhausted.
+  Nothing committed; resend the identical request with the same key.
+- `STARTER_PLOT_UNAVAILABLE` (409, `retryable: true`): spawn lost a race for
+  its starter plot. A retry is assigned a different plot.
+- `SEASON_TRANSITION` (409, `retryable: false`): the season cutoff passed and
+  this world is read-only. Resending the same request can never succeed
+  because the next season has a different world id; rediscover the current
+  world first.
 
 The following are representative currently emitted codes, not an exhaustive
 generated registry. An error-code/OpenAPI drift test remains beta work.
@@ -398,9 +428,9 @@ generated registry. An error-code/OpenAPI drift test remains beta work.
 |---:|---|
 | 400 | `VALIDATION_ERROR`, `IDEMPOTENCY_KEY_REQUIRED`, `INVALID_CURSOR`, `INVALID_PLAYER_NAME`, `INVALID_ALLIANCE_NAME`, `INVALID_MESSAGE`, `INVALID_RESOURCES`, `EMPTY_TRADE`, `ONE_RECIPIENT_REQUIRED`, `SELF_TARGET`, `PLAYER_REQUIRED` |
 | 401 | `AUTHENTICATION_REQUIRED`, `INVALID_ACCESS_TOKEN` |
-| 403 | `INSUFFICIENT_SCOPE`, `ACCOUNT_SUSPENDED`, `INTERACTION_UNAVAILABLE`, `NOT_ALLIANCE_MEMBER`, `NOT_ALLIANCE_LEADER`, `NOT_TRADE_SENDER`, `NOT_TRADE_RECIPIENT` |
+| 403 | `INSUFFICIENT_SCOPE`, `ACCOUNT_SUSPENDED`, `TRUST_REQUIRED`, `INTERACTION_UNAVAILABLE`, `NOT_ALLIANCE_MEMBER`, `NOT_ALLIANCE_LEADER`, `NOT_TRADE_SENDER`, `NOT_TRADE_RECIPIENT` |
 | 404 | `NOT_FOUND`, `WORLD_NOT_FOUND`, `PLAYER_NOT_FOUND`, `TARGET_NOT_FOUND`, `TRADE_NOT_FOUND`, `ALLIANCE_NOT_FOUND`, `ALLIANCE_MEMBER_NOT_FOUND`, `INVITE_NOT_FOUND` |
-| 409 | `CONFLICT`, `WORLD_NOT_ACTIVE`, `WORLD_FULL`, `IDEMPOTENCY_KEY_REUSED`, `ACTION_IN_PROGRESS`, rule violation codes such as `INSUFFICIENT_RESOURCES`, `COOLDOWN_ACTIVE`, `TILE_OCCUPIED`, trade state codes, and alliance state codes |
+| 409 | `CONFLICT`, `CONCURRENT_MODIFICATION`, `WORLD_NOT_ACTIVE`, `SEASON_TRANSITION`, `WORLD_FULL`, `STARTER_PLOT_UNAVAILABLE`, `PLAYER_ALREADY_EXISTS`, `IDEMPOTENCY_KEY_REUSED`, `ACTION_IN_PROGRESS`, rule violation codes such as `INSUFFICIENT_RESOURCES`, `COOLDOWN_ACTIVE`, `TILE_OCCUPIED`, trade state codes, and alliance state codes |
 | 429 | `RATE_LIMITED` |
 | 500 | `INTERNAL_ERROR` |
 

@@ -14,6 +14,7 @@ import { sql } from "kysely";
 import { v7 as uuidv7 } from "uuid";
 import type { GameService } from "./game-service.ts";
 import { HttpProblem } from "./problem.ts";
+import { runSerializable } from "./transaction.ts";
 
 type Actor = Awaited<ReturnType<GameService["requireActor"]>>;
 
@@ -212,125 +213,137 @@ export class SocialService {
         "A 1 to 128 character Idempotency-Key is required",
       );
     }
-    return this.database
-      .transaction()
-      .setIsolationLevel("serializable")
-      .execute(async (transaction) => {
-        const actor = await this.game.requireActor(transaction, userId, worldId, true);
-        await this.game.requireMutableWorld(transaction, worldId);
-        await sql`select pg_advisory_xact_lock(hashtextextended(${`${actor.id}:${key}`}, 0))`.execute(
-          transaction,
-        );
-        const hash = digest(action, body);
-        const existing = await transaction
-          .selectFrom("actions")
-          .selectAll()
-          .where("worldId", "=", worldId)
-          .where("playerId", "=", actor.id)
-          .where("idempotencyKey", "=", key)
-          .executeTakeFirst();
-        if (existing) {
-          if (existing.actionType !== action || existing.requestHash !== hash) {
-            throw new HttpProblem(
-              409,
-              "IDEMPOTENCY_KEY_REUSED",
-              "This idempotency key was used for different input",
-            );
-          }
-          if (existing.state === "completed" && existing.response !== null)
-            return existing.response as T;
+    // Re-entrant under retry: identifiers are generated per attempt and every write is transactional.
+    return runSerializable(this.database, async (transaction) => {
+      const actor = await this.game.requireActor(transaction, userId, worldId, true);
+      await this.game.requireMutableWorld(transaction, worldId);
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`${actor.id}:${key}`}, 0))`.execute(
+        transaction,
+      );
+      const hash = digest(action, body);
+      const existing = await transaction
+        .selectFrom("actions")
+        .selectAll()
+        .where("worldId", "=", worldId)
+        .where("playerId", "=", actor.id)
+        .where("idempotencyKey", "=", key)
+        .executeTakeFirst();
+      if (existing) {
+        if (existing.actionType !== action || existing.requestHash !== hash) {
           throw new HttpProblem(
             409,
-            "ACTION_IN_PROGRESS",
-            "This request is already processing",
-            true,
-            1,
+            "IDEMPOTENCY_KEY_REUSED",
+            "This idempotency key was used for different input",
           );
         }
-        const actionId = this.newId();
-        await transaction
-          .insertInto("actions")
-          .values({
-            id: actionId,
-            worldId,
-            playerId: actor.id,
-            idempotencyKey: key,
-            requestHash: hash,
-            actionType: action,
-            state: "processing",
-            response: null,
-            completedAt: null,
-          })
-          .execute();
-        const result = await execute(transaction, actor, actionId);
-        await this.game.recordPlayerEvent(
-          transaction,
-          worldId,
-          actor.id,
-          actionId,
-          `${action.replaceAll("-", "_").toUpperCase()}_COMPLETED`,
+        if (existing.state === "completed" && existing.response !== null)
+          return existing.response as T;
+        throw new HttpProblem(
+          409,
+          "ACTION_IN_PROGRESS",
+          "This request is already processing",
+          true,
+          1,
         );
-        await transaction
-          .updateTable("actions")
-          .set({
-            state: "completed",
-            response: json(result),
-            completedAt: this.now(),
-          })
-          .where("id", "=", actionId)
-          .execute();
-        return result;
-      });
+      }
+      const actionId = this.newId();
+      await transaction
+        .insertInto("actions")
+        .values({
+          id: actionId,
+          worldId,
+          playerId: actor.id,
+          idempotencyKey: key,
+          requestHash: hash,
+          actionType: action,
+          state: "processing",
+          response: null,
+          completedAt: null,
+        })
+        .execute();
+      const result = await execute(transaction, actor, actionId);
+      await this.game.recordPlayerEvent(
+        transaction,
+        worldId,
+        actor.id,
+        actionId,
+        `${action.replaceAll("-", "_").toUpperCase()}_COMPLETED`,
+      );
+      await transaction
+        .updateTable("actions")
+        .set({
+          state: "completed",
+          response: json(result),
+          completedAt: this.now(),
+        })
+        .where("id", "=", actionId)
+        .execute();
+      return result;
+    });
   }
 
-  public async messages(userId: string, worldId: string, cursor?: string) {
+  /** Newest-first page of the actor's visible messages. A read path: it never persists anything. */
+  public async messages(userId: string, worldId: string, cursor?: string, limit = 50) {
+    const pageSize = Math.min(Math.max(limit, 1), 50);
     const actor = await this.game.requireActor(this.database, userId, worldId);
-    await this.game.requireTrustTier(this.database, actor.id, worldId, 1);
+    await this.game.requireTrustTier(this.database, actor.id, worldId, 1, { persist: false });
     const before = cursor
       ? new Date(Buffer.from(cursor, "base64url").toString("utf8"))
       : this.now();
     if (Number.isNaN(before.getTime()))
       throw new HttpProblem(400, "INVALID_CURSOR", "Invalid cursor");
-    const [rows, muteRows] = await Promise.all([
-      this.database
-        .selectFrom("messages")
-        .selectAll()
-        .where("worldId", "=", worldId)
-        .where("deletedAt", "is", null)
-        .where("sentAt", "<", before)
-        .where((expression) =>
-          expression.or([
-            expression("senderPlayerId", "=", actor.id),
-            expression("recipientPlayerId", "=", actor.id),
-            ...(actor.allianceId ? [expression("allianceId", "=", actor.allianceId)] : []),
-          ]),
-        )
-        .orderBy("sentAt", "desc")
-        .limit(100)
-        .execute(),
-      this.database
-        .selectFrom("messageMutes")
-        .select("channelId")
-        .where("worldId", "=", worldId)
-        .where("playerId", "=", actor.id)
-        .execute(),
-    ]);
-    const mutedChannels = new Set(muteRows.map((row) => row.channelId));
-    const visibleRows = rows
-      .filter(
-        (row) =>
-          row.senderPlayerId === actor.id ||
-          (!mutedChannels.has(row.senderPlayerId) &&
-            (row.allianceId === null || !mutedChannels.has(row.allianceId))),
+    const rows = await this.database
+      .selectFrom("messages")
+      .selectAll()
+      .where("worldId", "=", worldId)
+      .where("deletedAt", "is", null)
+      .where("sentAt", "<", before)
+      .where((expression) =>
+        expression.or([
+          expression("senderPlayerId", "=", actor.id),
+          expression("recipientPlayerId", "=", actor.id),
+          ...(actor.allianceId ? [expression("allianceId", "=", actor.allianceId)] : []),
+        ]),
       )
-      .slice(0, 50);
+      // Mutes are applied in SQL so the page limit is exact and the cursor never skips rows.
+      .where((expression) =>
+        expression.or([
+          expression("senderPlayerId", "=", actor.id),
+          expression.not(
+            expression.exists(
+              expression
+                .selectFrom("messageMutes")
+                .select("messageMutes.channelId")
+                .where("messageMutes.worldId", "=", worldId)
+                .where("messageMutes.playerId", "=", actor.id)
+                .where((mute) =>
+                  mute.or([
+                    mute(
+                      "messageMutes.channelId",
+                      "=",
+                      mute.cast<string>("messages.senderPlayerId", "text"),
+                    ),
+                    mute(
+                      "messageMutes.channelId",
+                      "=",
+                      mute.cast<string>("messages.allianceId", "text"),
+                    ),
+                  ]),
+                ),
+            ),
+          ),
+        ]),
+      )
+      .orderBy("sentAt", "desc")
+      .limit(pageSize)
+      .execute();
     return {
-      items: visibleRows.map(messageView),
-      ...(visibleRows.length === 50
+      items: rows.map(messageView),
+      ...(rows.length === pageSize
         ? {
-            nextCursor: Buffer.from(
-              new Date(visibleRows.at(-1)?.sentAt ?? before).toISOString(),
-            ).toString("base64url"),
+            nextCursor: Buffer.from(new Date(rows.at(-1)?.sentAt ?? before).toISOString()).toString(
+              "base64url",
+            ),
           }
         : {}),
     };

@@ -158,21 +158,43 @@ required beta lifecycle is:
    return `IDEMPOTENCY_KEY_REUSED` without changing state.
 7. Lock required inventory, tile, structure, relationship, alliance, and trade
    rows in deterministic identifier order.
-8. Derive the effective tick and settle due passive production up to that tick.
-9. Load a minimal snapshot and invoke the pure rules decision.
-10. Apply effects, resource-ledger entries, aggregate versions, and discovery.
+8. Derive the effective tick from the world clock and `ruleset.ticksPerSecond`
+   (`tickAt`/`dateAtTick` convert in both directions) and settle due passive
+   production up to that tick.
+9. Load the snapshot and invoke the pure rules decision. Today `loadGame` reads
+   the whole world: every player, inventory, structure, hostility, cooldown,
+   and combat award window. Narrowing it to what the decision needs is a
+   tracked follow-up; until then the transaction shape below is what keeps
+   concurrent play correct.
+10. Apply effects, resource-ledger entries, aggregate versions, and discovery,
+    writing only rows whose state changed. Players, inventories, and
+    structures are diffed against the loaded snapshot; hostilities are diffed
+    by aggressor/defender pair so an unrelated action never rewrites them. A
+    trust-tier promotion earned by the action is persisted on the
+    civilization here, so game actions and social actions earn trust alike.
 11. Append immutable event envelopes and persist any construction schedule in
     the same transaction. Any future queue enqueue must preserve this atomic
     boundary rather than becoming a second source of truth.
 12. Store the complete action receipt against the idempotency record and commit.
 
-Bounded whole-transaction retry for deadlock and serialization failures is
-still pending; rule failures are not retryable. A successful current game
-mutation is not acknowledged before its state, relevant ledger/events, and
-receipt commit.
+Every serializable transaction (`spawn`, game `mutate`, and social mutations)
+runs through `runSerializable` in `apps/server/src/transaction.ts`: at most
+four attempts, retrying only PostgreSQL `40001` (serialization failure) and
+`40P01` (deadlock) with jittered backoff of roughly 10–20, 20–40, and 40–80 ms.
+Callbacks are re-entrant because identifiers are generated per attempt and
+every side effect lives inside the transaction, so a retried attempt observes
+the winner's committed state; a concurrent identical request, for example,
+replays the stored receipt on its second attempt. Rule failures and other
+`HttpProblem`s are never retried. When the budget is exhausted the API answers
+`409 CONCURRENT_MODIFICATION` with `retryable: true` and a `Retry-After`
+header; nothing committed, so the client resends with the same idempotency
+key. A successful game mutation is not acknowledged before its state, relevant
+ledger/events, and receipt commit.
 
 Read endpoints may project lazy production at a captured effective tick without
-persisting it. A later mutation remains responsible for settlement.
+persisting it, and they never write: trust-tier checks on read paths run with
+`persist: false`. A later mutation remains responsible for settlement and for
+persisting an earned trust tier.
 
 ## Time and determinism
 
@@ -281,6 +303,20 @@ database constraints remain the last defense.
 - Aggregate versions increment with mutations.
 - Action/idempotency uniqueness is scoped to the authenticated actor.
 - Locks are acquired by stable entity category and then ascending ID.
+- Serialization failures and deadlocks are retried inside the process, at most
+  four attempts with jittered backoff, and only for PostgreSQL `40001`/`40P01`.
+  Residual failures surface as `409 CONCURRENT_MODIFICATION`, never as `500`.
+- Because the mutation snapshot is still whole-world, any two concurrent
+  mutations in one world can form a read/write dependency cycle under SSI even
+  when they touch different players. The retry makes this recoverable; the
+  snapshot follow-up is what will make it rare. `persistDecision` writes only
+  changed rows (players, inventories, structures, and hostilities are diffed
+  against the loaded snapshot) so that write amplification does not widen the
+  conflict footprint further.
+- Starter-plot allocation selects with `FOR UPDATE SKIP LOCKED` and excludes
+  plots whose tiles already carry a live or constructing structure, so one
+  occupied plot cannot block registration for the world. Losing the residual
+  race returns the retryable `STARTER_PLOT_UNAVAILABLE`.
 
 The current worker polls PostgreSQL for due construction, trade expiry, and
 world cutoffs. Construction activation, player progress, and its immutable

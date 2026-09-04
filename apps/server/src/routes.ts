@@ -355,7 +355,13 @@ export async function registerGameRoutes(
         tags: ["social"],
       },
     },
-    (request) => social.messages(principal(request), request.params.worldId, request.query.cursor),
+    (request) =>
+      social.messages(
+        principal(request),
+        request.params.worldId,
+        request.query.cursor,
+        request.query.limit,
+      ),
   );
   app.post<{ Params: WorldParams; Body: Static<typeof SendMessageRequest> }>(
     "/v1/worlds/:worldId/messages",

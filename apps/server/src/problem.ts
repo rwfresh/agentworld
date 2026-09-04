@@ -32,5 +32,9 @@ export function sendProblem(
     retryable: problem.retryable,
     ...(problem.retryAfter === undefined ? {} : { retryAfter: problem.retryAfter }),
   };
+  if (problem.retryAfter !== undefined) {
+    // Mirror the body hint as the standard header so generic HTTP clients can back off too.
+    reply.header("retry-after", String(problem.retryAfter));
+  }
   return reply.type("application/problem+json").code(problem.status).send(body);
 }
