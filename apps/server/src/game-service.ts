@@ -1726,6 +1726,15 @@ export class GameService {
         .execute();
     }
     for (const allianceId of affectedAlliances) {
+      // Serialize alliance totals per alliance so two members' concurrent mutations cannot both
+      // write a sum that omits the other's delta; the worker takes the same lock.
+      await transaction
+        .selectFrom("alliances")
+        .select("id")
+        .where("worldId", "=", loaded.dbWorld.id)
+        .where("id", "=", allianceId)
+        .forUpdate()
+        .executeTakeFirstOrThrow();
       const members = await transaction
         .selectFrom("players")
         .select("influence")
