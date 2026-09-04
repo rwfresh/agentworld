@@ -95,6 +95,8 @@ export const EventSummary = Type.Object(
     tick: SafeInteger,
     occurredAt: Type.String({ format: "date-time" }),
     actorPlayerId: Type.Optional(Identifier),
+    // Present when the event was done to another player, who also receives it in their feed.
+    targetPlayerId: Type.Optional(Identifier),
     payload: Type.Record(Type.String(), Type.Unknown()),
   },
   { additionalProperties: false },
@@ -431,6 +433,25 @@ export const AllianceInviteAcceptResponse = Type.Object(
 );
 export type AllianceInviteAcceptResponse = Static<typeof AllianceInviteAcceptResponse>;
 
+/** One pending, unexpired invitation as the invitee sees it. */
+export const AllianceInviteView = Type.Object(
+  {
+    inviteId: Identifier,
+    allianceId: Identifier,
+    allianceName: UntrustedText,
+    invitedByPlayerId: Identifier,
+    expiresAt: Type.String({ format: "date-time" }),
+  },
+  { additionalProperties: false },
+);
+export type AllianceInviteView = Static<typeof AllianceInviteView>;
+
+export const AllianceLeadershipRequest = Type.Object(
+  { playerId: Identifier },
+  { additionalProperties: false },
+);
+export type AllianceLeadershipRequest = Static<typeof AllianceLeadershipRequest>;
+
 export const AllianceAdministrationOperation = Type.Union([
   Type.Literal("leave"),
   Type.Literal("leadership"),
@@ -461,6 +482,39 @@ export const AllianceView = Type.Object(
   { additionalProperties: false },
 );
 export type AllianceView = Static<typeof AllianceView>;
+
+export const RelationshipRole = Type.Union([Type.Literal("aggressor"), Type.Literal("defender")]);
+export type RelationshipRole = Static<typeof RelationshipRole>;
+
+/**
+ * Where the current tick falls in a declaration's warmup and retaliation windows. The engine alone
+ * decides whether a given attack is permitted; the state only names the window each side is in.
+ */
+export const RelationshipState = Type.Union([
+  Type.Literal("warmup"),
+  Type.Literal("active"),
+  Type.Literal("withdrawn"),
+  Type.Literal("retaliation_window"),
+  Type.Literal("ended"),
+]);
+export type RelationshipState = Static<typeof RelationshipState>;
+
+export const RelationshipView = Type.Object(
+  {
+    aggressorPlayerId: Identifier,
+    defenderPlayerId: Identifier,
+    declaredAt: Type.String({ format: "date-time" }),
+    attacksAllowedAt: Type.String({ format: "date-time" }),
+    // Present only once the aggressor has withdrawn.
+    withdrawnAt: Type.Optional(Type.String({ format: "date-time" })),
+    retaliationEndsAt: Type.Optional(Type.String({ format: "date-time" })),
+    // The reader's side of the row.
+    role: RelationshipRole,
+    state: RelationshipState,
+  },
+  { additionalProperties: false },
+);
+export type RelationshipView = Static<typeof RelationshipView>;
 
 export const Page = <T extends ReturnType<typeof Type.Object>>(item: T) =>
   Type.Object(
@@ -494,3 +548,9 @@ export type TradePageResponse = Static<typeof TradePageResponse>;
 
 export const AllianceListResponse = Page(AllianceView);
 export type AllianceListResponse = Static<typeof AllianceListResponse>;
+
+export const AllianceInviteListResponse = Page(AllianceInviteView);
+export type AllianceInviteListResponse = Static<typeof AllianceInviteListResponse>;
+
+export const RelationshipListResponse = Page(RelationshipView);
+export type RelationshipListResponse = Static<typeof RelationshipListResponse>;

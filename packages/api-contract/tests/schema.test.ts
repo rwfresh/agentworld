@@ -3,11 +3,19 @@ import { describe, expect, it } from "vitest";
 import {
   AllianceAdministrationResponse,
   AllianceInviteAcceptResponse,
+  AllianceInviteListResponse,
   AllianceInviteResponse,
+  AllianceInviteView,
+  AllianceLeadershipRequest,
   AttackRequest,
+  EventSummary,
   InstallationDiscovery,
   InventoryResponse,
   LeaderboardResponse,
+  RelationshipListResponse,
+  RelationshipRole,
+  RelationshipState,
+  RelationshipView,
   ScanActionReceipt,
   Terrain,
   Zone,
@@ -75,6 +83,67 @@ describe("public game schemas", () => {
       "disband",
     ]);
     expect(Value.Check(AllianceAdministrationResponse.properties.operation, "merge")).toBe(false);
+  });
+
+  it("lets an event name the player it was done to without requiring one", () => {
+    expect(EventSummary.required).toEqual([
+      "id",
+      "offset",
+      "type",
+      "tick",
+      "occurredAt",
+      "payload",
+    ]);
+    expect(EventSummary.properties.targetPlayerId).toMatchObject({ format: "uuid" });
+    expect(EventSummary.additionalProperties).toBe(false);
+  });
+
+  it("types pending alliance invitations for the invitee", () => {
+    expect(AllianceInviteView.required).toEqual([
+      "inviteId",
+      "allianceId",
+      "allianceName",
+      "invitedByPlayerId",
+      "expiresAt",
+    ]);
+    expect(AllianceInviteView.properties.allianceName.properties.trust).toMatchObject({
+      const: "untrusted_player_input",
+    });
+    expect(AllianceInviteListResponse.properties.items.items.required).toEqual(
+      AllianceInviteView.required,
+    );
+    expect(AllianceInviteListResponse.required).toEqual(["items"]);
+  });
+
+  it("types the leadership transfer request", () => {
+    expect(AllianceLeadershipRequest.required).toEqual(["playerId"]);
+    expect(AllianceLeadershipRequest.additionalProperties).toBe(false);
+    expect(Value.Check(AllianceLeadershipRequest, {})).toBe(false);
+  });
+
+  it("describes a relationship by the reader's role and the current window", () => {
+    expect(RelationshipView.required).toEqual([
+      "aggressorPlayerId",
+      "defenderPlayerId",
+      "declaredAt",
+      "attacksAllowedAt",
+      "role",
+      "state",
+    ]);
+    expect(RelationshipView.required).not.toContain("withdrawnAt");
+    expect(RelationshipView.required).not.toContain("retaliationEndsAt");
+    expect(literalValues(RelationshipRole)).toEqual(["aggressor", "defender"]);
+    expect(literalValues(RelationshipState)).toEqual([
+      "warmup",
+      "active",
+      "withdrawn",
+      "retaliation_window",
+      "ended",
+    ]);
+    expect(Value.Check(RelationshipState, "hostile")).toBe(false);
+    expect(RelationshipListResponse.properties.items.items.required).toEqual(
+      RelationshipView.required,
+    );
   });
 
   it("leaves the attack bonus ceiling to the ruleset", () => {

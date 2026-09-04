@@ -177,6 +177,11 @@ operator endpoint exposure, cursor tampering.
   world-scoped composite foreign keys and non-null `world_id`.
 - Authorize returned fields, not only route access. Use indistinguishable `404`
   responses when specificity would expose hidden state.
+- Deliver an event to at most one player other than its actor: hostility
+  declarations, withdrawals, and attack outcomes name their target and reach
+  the defender; every other event stays with its actor. A targeted payload
+  carries only the shared attack window and the defender's own structure
+  damage, never the actor's position, inventory, production, or influence.
 - Pending: sign/authenticate or server-store opaque pagination cursors bound to actor,
   world, route, filters, direction, and expiry.
 - Separate player API, private moderation/operator interfaces, and database

@@ -3,6 +3,7 @@ import { AgentWorldClient } from "@agentworld/api-client";
 import type {
   AllianceCreateRequest,
   AllianceInviteRequest,
+  AllianceLeadershipRequest,
   AttackRequest,
   BuildRequest,
   Direction,
@@ -652,6 +653,10 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
     return act((client, world, key) => client.createAlliance(world, body, key));
   });
   alliances
+    .command("invites")
+    .description("list your pending alliance invitations")
+    .action(() => act((client, world) => client.allianceInvites(world)));
+  alliances
     .command("invite <alliance-id> <player-id>")
     .action((allianceId: string, playerId: string) => {
       const body: AllianceInviteRequest = { playerId };
@@ -670,18 +675,25 @@ export function createCli(overrides: Partial<Runtime> = {}): Command {
   alliances
     .command("leadership <alliance-id> <player-id>")
     .description("transfer alliance leadership to a member")
-    .action((allianceId: string, playerId: string) =>
-      act((client, world, key) =>
-        client.transferAllianceLeadership(world, allianceId, playerId, key),
-      ),
-    );
+    .action((allianceId: string, playerId: string) => {
+      const body: AllianceLeadershipRequest = { playerId };
+      return act((client, world, key) =>
+        client.transferAllianceLeadership(world, allianceId, body, key),
+      );
+    });
   alliances
     .command("disband <alliance-id>")
     .action((allianceId: string) =>
       act((client, world, key) => client.disbandAlliance(world, allianceId, key)),
     );
 
-  const hostility = program.command("hostility").description("declare or withdraw hostility");
+  const hostility = program
+    .command("hostility")
+    .description("list, declare, or withdraw hostility");
+  hostility
+    .command("list")
+    .description("list hostilities in which you are the aggressor or the defender")
+    .action(() => act((client, world) => client.relationships(world)));
   for (const operation of ["declare", "withdraw"] as const) {
     hostility
       .command(`${operation} <player-id>`)

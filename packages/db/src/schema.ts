@@ -175,6 +175,8 @@ export interface EventsTable {
   emittingServerId: string;
   actionId: string | null;
   actorPlayerId: string | null;
+  /** The player the event was done to; the feed delivers the row to them as well as the actor. */
+  targetPlayerId: string | null;
   type: string;
   aggregateType: string;
   aggregateId: string;

@@ -200,6 +200,29 @@ describe("CLI commands", () => {
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("idempotency-key")).toBeTruthy();
   });
 
+  it.each([
+    [["alliances", "invites"], "https://play.example.test/v1/worlds/beta/alliance-invites"],
+    [["alliance", "invites"], "https://play.example.test/v1/worlds/beta/alliance-invites"],
+    [["hostility", "list"], "https://play.example.test/v1/worlds/beta/relationships"],
+  ])("issues %j as a plain read and prints the page", async (arguments_, url) => {
+    const page = { items: [{ role: "defender", state: "warmup" }] };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(JSON.stringify(page), { status: 200 }));
+    const { cli, stdout, stderr } = await worldCli({ fetchMock });
+
+    await cli.parseAsync(["node", "agentworld", "--json", ...arguments_]);
+
+    const [requestUrl, init] = fetchMock.mock.calls[0] ?? [];
+    expect(String(requestUrl)).toBe(url);
+    expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
+    expect(new Headers(init?.headers).has("idempotency-key")).toBe(false);
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer token");
+    expect(JSON.parse(stdout.join(""))).toEqual(page);
+    expect(stderr).toEqual([]);
+  });
+
   it("keeps look a read and no longer offers --scan", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()

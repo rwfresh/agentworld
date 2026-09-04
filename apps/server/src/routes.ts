@@ -3,8 +3,10 @@ import {
   AllianceAdministrationResponse,
   AllianceCreateRequest,
   AllianceInviteAcceptResponse,
+  AllianceInviteListResponse,
   AllianceInviteRequest,
   AllianceInviteResponse,
+  AllianceLeadershipRequest,
   AllianceListResponse,
   AllianceView,
   AttackRequest,
@@ -24,6 +26,7 @@ import {
   PlayerListResponse,
   PlayerStatus,
   PlayerSummary,
+  RelationshipListResponse,
   ReportReceipt,
   ReportRequest,
   ScanActionReceipt,
@@ -77,11 +80,6 @@ const PageQuery = Type.Object(
   },
   { additionalProperties: false },
 );
-const LeadershipRequest = Type.Object(
-  { playerId: Type.String({ format: "uuid" }) },
-  { additionalProperties: false },
-);
-
 type WorldParams = Static<typeof WorldParams>;
 type PlayerParams = Static<typeof PlayerParams>;
 type TradeParams = Static<typeof TradeParams>;
@@ -89,7 +87,6 @@ type AllianceParams = Static<typeof AllianceParams>;
 type InviteParams = Static<typeof InviteParams>;
 type ChannelParams = Static<typeof ChannelParams>;
 type PageQuery = Static<typeof PageQuery>;
-type LeadershipRequest = Static<typeof LeadershipRequest>;
 
 function principal(request: FastifyRequest): string {
   if (!request.principal)
@@ -343,6 +340,18 @@ export async function registerGameRoutes(
         true,
       ),
   );
+  app.get<{ Params: WorldParams }>(
+    "/v1/worlds/:worldId/relationships",
+    {
+      preHandler: auth(authRuntime, "world:read"),
+      schema: {
+        params: WorldParams,
+        response: { 200: RelationshipListResponse },
+        tags: ["combat"],
+      },
+    },
+    (request) => game.relationships(principal(request), request.params.worldId),
+  );
 
   app.get<{ Params: WorldParams; Querystring: PageQuery }>(
     "/v1/worlds/:worldId/messages",
@@ -545,6 +554,18 @@ export async function registerGameRoutes(
         request.body.playerId,
       ),
   );
+  app.get<{ Params: WorldParams }>(
+    "/v1/worlds/:worldId/alliance-invites",
+    {
+      preHandler: auth(authRuntime, "world:read"),
+      schema: {
+        params: WorldParams,
+        response: { 200: AllianceInviteListResponse },
+        tags: ["alliances"],
+      },
+    },
+    (request) => social.allianceInvites(principal(request), request.params.worldId),
+  );
   app.post<{ Params: InviteParams; Body: Record<string, never> }>(
     "/v1/worlds/:worldId/alliance-invites/:inviteId/accept",
     {
@@ -584,13 +605,13 @@ export async function registerGameRoutes(
         "leave",
       ),
   );
-  app.post<{ Params: AllianceParams; Body: LeadershipRequest }>(
+  app.post<{ Params: AllianceParams; Body: Static<typeof AllianceLeadershipRequest> }>(
     "/v1/worlds/:worldId/alliances/:allianceId/leadership",
     {
       preHandler: auth(authRuntime, "social:write"),
       schema: {
         params: AllianceParams,
-        body: LeadershipRequest,
+        body: AllianceLeadershipRequest,
         response: { 200: AllianceAdministrationResponse },
         tags: ["alliances"],
       },

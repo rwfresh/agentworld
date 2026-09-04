@@ -2,14 +2,18 @@ import type {
   ActionReceipt,
   AllianceAdministrationResponse,
   AllianceInviteAcceptResponse,
+  AllianceInviteListResponse,
   AllianceInviteResponse,
+  AllianceInviteView,
   InventoryResponse,
   LeaderboardResponse,
   LookResponse,
+  RelationshipListResponse,
+  RelationshipView,
   ScanActionReceipt,
 } from "@agentworld/api-contract";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
-import { AgentWorldApiError, createClient, defaultTimeoutMs } from "../src/index.ts";
+import { AgentWorldApiError, createClient, defaultTimeoutMs, type Page } from "../src/index.ts";
 
 const scanResult: LookResponse = {
   origin: { x: 12, y: 9 },
@@ -282,7 +286,7 @@ describe("AgentWorld API client", () => {
       await client.transferAllianceLeadership(
         "world-one",
         "alliance-one",
-        "player-two",
+        { playerId: "player-two" },
         "lead-once",
       );
       await client.disbandAlliance("world-one", "alliance-one", "disband-once");
@@ -311,6 +315,77 @@ describe("AgentWorld API client", () => {
           method: "DELETE",
           body: undefined,
           key: "disband-once",
+        },
+      ]);
+    });
+  });
+
+  describe("relationship and invitation reads", () => {
+    const relationships: RelationshipListResponse = {
+      items: [
+        {
+          aggressorPlayerId: "01991e7a-7d33-7f41-801c-1e9b5c82ef74",
+          defenderPlayerId: "01991e7a-7d33-7f41-801c-1e9b5c82ef75",
+          declaredAt: "2026-09-02T18:00:00.000Z",
+          attacksAllowedAt: "2026-09-02T18:15:00.000Z",
+          withdrawnAt: "2026-09-02T18:20:00.000Z",
+          retaliationEndsAt: "2026-09-02T18:35:00.000Z",
+          role: "defender",
+          state: "retaliation_window",
+        },
+      ],
+    };
+    const invitations: AllianceInviteListResponse = {
+      items: [
+        {
+          inviteId: "01991e7a-7d33-7f41-801c-1e9b5c82ef76",
+          allianceId: "01991e7a-7d33-7f41-801c-1e9b5c82ef72",
+          allianceName: { content: "Northern Accord", trust: "untrusted_player_input" },
+          invitedByPlayerId: "01991e7a-7d33-7f41-801c-1e9b5c82ef74",
+          expiresAt: "2026-09-03T18:00:00.000Z",
+        },
+      ],
+    };
+
+    it("lists hostilities and pending invitations as plain reads", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(jsonResponse(relationships))
+        .mockResolvedValueOnce(jsonResponse(invitations));
+      const client = createClient({
+        baseUrl: "https://play.example.test",
+        accessToken: "access-token",
+        fetch: fetchMock,
+      });
+
+      const hostilities = client.relationships("world/one");
+      expectTypeOf(hostilities).toEqualTypeOf<Promise<Page<RelationshipView>>>();
+      await expect(hostilities).resolves.toEqual(relationships);
+      const pending = client.allianceInvites("world/one");
+      expectTypeOf(pending).toEqualTypeOf<Promise<Page<AllianceInviteView>>>();
+      await expect(pending).resolves.toEqual(invitations);
+
+      const calls = fetchMock.mock.calls.map(([url, init]) => ({
+        url: String(url),
+        method: init?.method,
+        body: init?.body,
+        authorization: new Headers(init?.headers).get("authorization"),
+        key: new Headers(init?.headers).get("idempotency-key"),
+      }));
+      expect(calls).toEqual([
+        {
+          url: "https://play.example.test/v1/worlds/world%2Fone/relationships",
+          method: "GET",
+          body: undefined,
+          authorization: "Bearer access-token",
+          key: null,
+        },
+        {
+          url: "https://play.example.test/v1/worlds/world%2Fone/alliance-invites",
+          method: "GET",
+          body: undefined,
+          authorization: "Bearer access-token",
+          key: null,
         },
       ]);
     });

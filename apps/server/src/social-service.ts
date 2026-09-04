@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
+  AllianceInviteListResponse,
+  AllianceInviteView,
   AllianceView,
   MessageSendReceipt,
   MessageView,
@@ -302,11 +304,14 @@ export class SocialService {
     });
   }
 
-  /** Newest-first page of the actor's visible messages. A read path: it never persists anything. */
+  /**
+   * Newest-first page of the actor's visible messages. Reading is open to every trust tier so a
+   * new player can see what was sent to them; only sending is gated. A read path: it never
+   * persists anything.
+   */
   public async messages(userId: string, worldId: string, cursor?: string, limit = 50) {
     const pageSize = Math.min(Math.max(limit, 1), 50);
     const actor = await this.game.requireActor(this.database, userId, worldId);
-    await this.game.requireTrustTier(this.database, actor.id, worldId, 1, { persist: false });
     const before = cursor
       ? new Date(Buffer.from(cursor, "base64url").toString("utf8"))
       : this.now();
@@ -886,6 +891,47 @@ export class SocialService {
             .filter((member) => member.allianceId === row.id)
             .map((member) => member.playerId),
           influence: row.influence,
+        }),
+      ),
+    };
+  }
+
+  /** The actor's pending, unexpired invitations. A read path: it never persists anything. */
+  public async allianceInvites(
+    userId: string,
+    worldId: string,
+  ): Promise<AllianceInviteListResponse> {
+    const actor = await this.game.requireActor(this.database, userId, worldId);
+    const rows = await this.database
+      .selectFrom("allianceInvites")
+      .innerJoin("alliances", (join) =>
+        join
+          .onRef("alliances.id", "=", "allianceInvites.allianceId")
+          .onRef("alliances.worldId", "=", "allianceInvites.worldId"),
+      )
+      .select([
+        "allianceInvites.id",
+        "allianceInvites.allianceId",
+        "allianceInvites.invitedByPlayerId",
+        "allianceInvites.expiresAt",
+        "alliances.name",
+      ])
+      .where("allianceInvites.worldId", "=", worldId)
+      .where("allianceInvites.playerId", "=", actor.id)
+      .where("allianceInvites.state", "=", "pending")
+      .where("allianceInvites.expiresAt", ">", this.now())
+      .where("alliances.disbandedAt", "is", null)
+      .orderBy("allianceInvites.expiresAt")
+      .orderBy("allianceInvites.id")
+      .execute();
+    return {
+      items: rows.map(
+        (row): AllianceInviteView => ({
+          inviteId: row.id,
+          allianceId: row.allianceId,
+          allianceName: untrusted(row.name),
+          invitedByPlayerId: row.invitedByPlayerId,
+          expiresAt: new Date(row.expiresAt).toISOString(),
         }),
       ),
     };

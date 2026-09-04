@@ -5,6 +5,9 @@ import type {
   LookResponse,
   PlayerStatus,
   PlayerSummary,
+  RelationshipListResponse,
+  RelationshipState,
+  RelationshipView,
   StructureKind,
   StructureView,
   TileView,
@@ -170,6 +173,58 @@ function resourcesWire(value: {
 
 function domainStructureKind(value: StructureKind): StructureType {
   return wireToStructure[value];
+}
+
+/**
+ * The player an event was done to, who receives it in their feed alongside the actor. Only
+ * hostility and combat outcomes name a target: movement, scans, harvests, production, construction,
+ * and influence awards describe the actor's private state and stay actor-only.
+ */
+function eventTargetPlayerId(event: DomainEvent, snapshot: GameSnapshot): string | null {
+  switch (event.type) {
+    case "HOSTILITY_DECLARED":
+    case "HOSTILITY_WITHDRAWN":
+      return event.defenderId;
+    case "STRUCTURE_ATTACKED": {
+      const target = snapshot.structures.find(
+        (structure) => structure.id === event.targetStructureId,
+      );
+      if (target === undefined) throw new Error("attacked structure is missing from the snapshot");
+      return target.ownerId;
+    }
+    case "STRUCTURE_DESTROYED":
+      return event.formerOwnerId;
+    default:
+      return null;
+  }
+}
+
+type CombatWindows = Pick<
+  Ruleset["combat"],
+  "hostilityWarmupTicks" | "retaliationAfterWithdrawalTicks"
+>;
+
+/**
+ * Place the effective tick in a declaration's warmup and retaliation windows. This restates no
+ * decision: whether a given attack is permitted (counter-declarations, alliances, adjacency) is the
+ * engine's alone, and the boundaries below are the ones it applies: the aggressor may attack from
+ * the tick the warmup elapses, the defender may retaliate through the final retaliation tick. A
+ * withdrawn declaration whose retaliation window has closed stays `withdrawn` until its original
+ * warmup would have elapsed, because the withdrawal binds the aggressor for exactly that long; with
+ * beta-v1's equal window lengths that gap is empty and the row moves straight to `ended`.
+ */
+export function hostilityState(
+  declaredAtTick: Tick,
+  withdrawnAtTick: Tick | undefined,
+  effectiveTick: Tick,
+  combat: CombatWindows,
+): RelationshipState {
+  const warmupElapsed = effectiveTick >= declaredAtTick + combat.hostilityWarmupTicks;
+  if (withdrawnAtTick === undefined) return warmupElapsed ? "active" : "warmup";
+  if (effectiveTick <= withdrawnAtTick + combat.retaliationAfterWithdrawalTicks) {
+    return "retaliation_window";
+  }
+  return warmupElapsed ? "ended" : "withdrawn";
 }
 
 export class GameService {
@@ -698,9 +753,13 @@ export class GameService {
       .where((expression) =>
         expression.or([
           expression("visibility", "=", "public"),
+          // A player event reaches its actor and, when it was done to someone, its target.
           expression.and([
             expression("visibility", "=", "player"),
-            expression("actorPlayerId", "=", actor.id),
+            expression.or([
+              expression("actorPlayerId", "=", actor.id),
+              expression("targetPlayerId", "=", actor.id),
+            ]),
           ]),
           ...(actor.allianceId
             ? [
@@ -724,12 +783,74 @@ export class GameService {
           tick: row.tick,
           occurredAt: date(row.occurredAt).toISOString(),
           ...(row.actorPlayerId ? { actorPlayerId: row.actorPlayerId } : {}),
+          ...(row.targetPlayerId ? { targetPlayerId: row.targetPlayerId } : {}),
           payload: row.payload as Record<string, unknown>,
         }),
       ),
       ...(rows.length === Math.min(Math.max(limit, 1), 100)
         ? { nextCursor: String(rows.at(-1)?.offset ?? offset) }
         : {}),
+    };
+  }
+
+  /**
+   * Every hostility declaration the actor is party to, newest first, with the window the current
+   * tick falls in. Windows are derived from the declaration tick and the world's ruleset exactly as
+   * the engine derives them, so the state can never disagree with what `decide` will enforce.
+   */
+  public async relationships(
+    userIdValue: string,
+    worldIdValue: string,
+  ): Promise<RelationshipListResponse> {
+    const actor = await this.requireActor(this.database, userIdValue, worldIdValue);
+    const world = await this.requireWorld(this.database, worldIdValue);
+    const ruleset = storedRuleset(world);
+    const effectiveTick = tickAt(world.startsAt, world.endsAt, ruleset, this.now());
+    const rows = await this.database
+      .selectFrom("hostilities")
+      .selectAll()
+      .where("worldId", "=", worldIdValue)
+      .where((expression) =>
+        expression.or([
+          expression("aggressorPlayerId", "=", actor.id),
+          expression("defenderPlayerId", "=", actor.id),
+        ]),
+      )
+      .orderBy("declaredAt", "desc")
+      .orderBy("aggressorPlayerId")
+      .orderBy("defenderPlayerId")
+      .execute();
+    return {
+      items: rows.map((row): RelationshipView => {
+        const declaredAtTick = tickAt(world.startsAt, world.endsAt, ruleset, date(row.declaredAt));
+        const withdrawnAt = row.withdrawnAt === null ? undefined : date(row.withdrawnAt);
+        const withdrawnAtTick =
+          withdrawnAt === undefined
+            ? undefined
+            : tickAt(world.startsAt, world.endsAt, ruleset, withdrawnAt);
+        return {
+          aggressorPlayerId: row.aggressorPlayerId,
+          defenderPlayerId: row.defenderPlayerId,
+          declaredAt: date(row.declaredAt).toISOString(),
+          attacksAllowedAt: dateAtTick(
+            world.startsAt,
+            ruleset,
+            declaredAtTick + ruleset.combat.hostilityWarmupTicks,
+          ).toISOString(),
+          ...(withdrawnAt === undefined || withdrawnAtTick === undefined
+            ? {}
+            : {
+                withdrawnAt: withdrawnAt.toISOString(),
+                retaliationEndsAt: dateAtTick(
+                  world.startsAt,
+                  ruleset,
+                  withdrawnAtTick + ruleset.combat.retaliationAfterWithdrawalTicks,
+                ).toISOString(),
+              }),
+          role: row.aggressorPlayerId === actor.id ? "aggressor" : "defender",
+          state: hostilityState(declaredAtTick, withdrawnAtTick, effectiveTick, ruleset.combat),
+        };
+      }),
     };
   }
 
@@ -1834,6 +1955,7 @@ export class GameService {
         aggregateType,
         aggregateId,
       );
+      const targetPlayerId = eventTargetPlayerId(event, loaded.snapshot);
       const inserted = await transaction
         .insertInto("events")
         .values({
@@ -1842,6 +1964,7 @@ export class GameService {
           emittingServerId: loaded.dbWorld.homeServerId,
           actionId,
           actorPlayerId: eventActorId,
+          targetPlayerId,
           type,
           aggregateType,
           aggregateId,
@@ -1862,6 +1985,7 @@ export class GameService {
           tick: eventTick,
           occurredAt: date(inserted.occurredAt).toISOString(),
           actorPlayerId: eventActorId,
+          ...(targetPlayerId === null ? {} : { targetPlayerId }),
           payload: payload as Record<string, unknown>,
         });
       }

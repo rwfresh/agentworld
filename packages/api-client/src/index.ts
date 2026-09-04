@@ -5,6 +5,8 @@ import type {
   AllianceInviteAcceptResponse,
   AllianceInviteRequest,
   AllianceInviteResponse,
+  AllianceInviteView,
+  AllianceLeadershipRequest,
   AllianceView,
   AttackRequest,
   BuildRequest,
@@ -22,6 +24,7 @@ import type {
   PlayerStatus,
   PlayerSummary,
   ProblemDetails,
+  RelationshipView,
   ReportReceipt,
   ReportRequest,
   ScanActionReceipt,
@@ -484,6 +487,16 @@ export class AgentWorldClient {
     return this.#request("GET", `/v1/worlds/${encodePath(worldId)}/alliances`, { ...options });
   }
 
+  /** The caller's pending, unexpired alliance invitations. */
+  public allianceInvites(
+    worldId: string,
+    options?: RequestOptions,
+  ): Promise<Page<AllianceInviteView>> {
+    return this.#request("GET", `/v1/worlds/${encodePath(worldId)}/alliance-invites`, {
+      ...options,
+    });
+  }
+
   public createAlliance(
     worldId: string,
     request: AllianceCreateRequest,
@@ -540,14 +553,14 @@ export class AgentWorldClient {
   public transferAllianceLeadership(
     worldId: string,
     allianceId: string,
-    playerId: string,
+    request: AllianceLeadershipRequest,
     key: string,
     options?: RequestOptions,
   ): Promise<AllianceAdministrationResponse> {
     return this.#request(
       "POST",
       `/v1/worlds/${encodePath(worldId)}/alliances/${encodePath(allianceId)}/leadership`,
-      { body: { playerId }, idempotencyKey: key, ...options },
+      { body: request, idempotencyKey: key, ...options },
     );
   }
 
@@ -562,6 +575,13 @@ export class AgentWorldClient {
       `/v1/worlds/${encodePath(worldId)}/alliances/${encodePath(allianceId)}`,
       { idempotencyKey: key, ...options },
     );
+  }
+
+  /** Every hostility declaration in which the caller is the aggressor or the defender. */
+  public relationships(worldId: string, options?: RequestOptions): Promise<Page<RelationshipView>> {
+    return this.#request("GET", `/v1/worlds/${encodePath(worldId)}/relationships`, {
+      ...options,
+    });
   }
 
   public setHostility(

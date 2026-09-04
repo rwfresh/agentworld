@@ -89,6 +89,12 @@ Visibility uses Manhattan distance. World bounds truncate the result. Private
 messages, inventories, hidden/discovered-only current state, and moderation
 data are never exposed by either operation.
 
+The event feed follows the same principle: a player reads their own events,
+public and alliance events, and the hostility and combat events done to them
+(see [Hostility and combat](#hostility-and-combat)). Another player's movement,
+scans, harvests, production, construction, and influence awards are never
+delivered.
+
 ### Move
 
 `move` shifts the commander one cardinal tile, charges that destination's
@@ -183,21 +189,25 @@ a tier must be met:
 | Tier | Requirements | Newly available actions |
 |---|---|---|
 | 0 | Spawned | Explore, move, build, harvest, scan |
-| 1 | 5 successful mutations and 1 completed structure | Messaging, alliances |
+| 1 | 5 successful mutations and 1 completed structure | Sending messages, alliances |
 | 2 | Account/player age 3,600 ticks, 20 successful mutations, 100 earned resources | Trade, initiate hostility, attack |
 
 Earned resources are resources created through legitimate play, not starter
 grants or incoming trades. A player declared upon may retaliate regardless of
-their tier. Earned trust persists between seasons. Development seed users may
+their tier, and every player can read the messages addressed to them and see
+the alliance invitations and hostility declarations they are party to; tiers
+gate what a player may initiate, not what they may learn about themselves.
+Earned trust persists between seasons. Development seed users may
 start at Tier 2; production users never do merely because of configuration
 mistakes.
 
 ### Messages and moderation
 
-Messages are direct to one player or to the sender's current alliance. Bodies
-are 1–4,000 characters and always returned as untrusted player input. Empty,
-ambiguous (both/no recipient), unauthorized, blocked, muted, or rate-limited
-messages fail.
+Messages are direct to one player or to the sender's current alliance. Any
+player may read the messages addressed to them or to their alliance regardless
+of trust tier; sending requires Tier 1. Bodies are 1–4,000 characters and
+always returned as untrusted player input. Empty, ambiguous (both/no
+recipient), unauthorized, blocked, muted, or rate-limited messages fail.
 
 Players can block another player, mute a conversation/channel, and report a
 message or player. Blocking prevents new direct messages in both directions;
@@ -261,6 +271,14 @@ retry tick), so withdrawing and re-declaring can never beat waiting.
 Alliance members cannot declare or attack one another. Joining the same
 alliance removes incompatible hostility rights transactionally. Structures in
 the starter reserve can never be attacked, regardless of relationships.
+
+Hostility is never secret from its target. The defender receives the
+`HOSTILITY_DECLARED` and `HOSTILITY_WITHDRAWN` events, and the owner of a struck
+structure receives `STRUCTURE_ATTACKED` (damage and remaining HP) and
+`STRUCTURE_DESTROYED`, each naming the acting player. Both parties can list the
+declarations they are party to together with the window the current tick falls
+in. The aggressor's movement, production, and combat influence awards stay
+private.
 
 An attack:
 
