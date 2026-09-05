@@ -50,7 +50,7 @@ function aggregateEvents(aggregateType: string, aggregateId: string) {
 }
 
 /**
- * Resolves once a backend in this database waits on a row lock, which is how the blocked worker
+ * Resolves once another backend waits on a row of `alliances`, which is how the blocked worker
  * transaction shows up. Fails if `pending` settles first, surfacing its own error when it rejected.
  */
 async function waitForLockWaiter(pending: Promise<unknown>): Promise<void> {
@@ -64,9 +64,20 @@ async function waitForLockWaiter(pending: Promise<unknown>): Promise<void> {
     },
   );
   for (let attempt = 0; attempt < 400 && !settled; attempt += 1) {
+    // A backend blocked on FOR UPDATE holds a granted tuple lock on the relation while it waits on
+    // the holder's transaction id, so require exactly that shape and ignore this connection.
     const waiting = await sql<{ count: string }>`
-      select count(*)::text as count from pg_stat_activity
-      where datname = current_database() and wait_event_type = 'Lock'
+      select count(*)::text as count
+      from pg_stat_activity activity
+      where activity.datname = current_database()
+        and activity.pid <> pg_backend_pid()
+        and activity.wait_event_type = 'Lock'
+        and exists (
+          select 1 from pg_locks held
+          where held.pid = activity.pid
+            and held.locktype = 'tuple'
+            and held.relation = 'alliances'::regclass
+        )
     `.execute(database);
     if (waiting.rows[0]?.count !== "0") return;
     await delay(25);

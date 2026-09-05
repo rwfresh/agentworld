@@ -6,7 +6,6 @@ import type {
   PlayerStatus,
   PlayerSummary,
   RelationshipListResponse,
-  RelationshipState,
   RelationshipView,
   StructureKind,
   StructureView,
@@ -30,6 +29,7 @@ import {
   type GameCommand,
   type GameSnapshot,
   type HostilityState,
+  hostilityWindowState,
   inventoryTotal,
   look,
   playerId,
@@ -197,34 +197,6 @@ function eventTargetPlayerId(event: DomainEvent, snapshot: GameSnapshot): string
     default:
       return null;
   }
-}
-
-type CombatWindows = Pick<
-  Ruleset["combat"],
-  "hostilityWarmupTicks" | "retaliationAfterWithdrawalTicks"
->;
-
-/**
- * Place the effective tick in a declaration's warmup and retaliation windows. This restates no
- * decision: whether a given attack is permitted (counter-declarations, alliances, adjacency) is the
- * engine's alone, and the boundaries below are the ones it applies: the aggressor may attack from
- * the tick the warmup elapses, the defender may retaliate through the final retaliation tick. A
- * withdrawn declaration whose retaliation window has closed stays `withdrawn` until its original
- * warmup would have elapsed, because the withdrawal binds the aggressor for exactly that long; with
- * beta-v1's equal window lengths that gap is empty and the row moves straight to `ended`.
- */
-export function hostilityState(
-  declaredAtTick: Tick,
-  withdrawnAtTick: Tick | undefined,
-  effectiveTick: Tick,
-  combat: CombatWindows,
-): RelationshipState {
-  const warmupElapsed = effectiveTick >= declaredAtTick + combat.hostilityWarmupTicks;
-  if (withdrawnAtTick === undefined) return warmupElapsed ? "active" : "warmup";
-  if (effectiveTick <= withdrawnAtTick + combat.retaliationAfterWithdrawalTicks) {
-    return "retaliation_window";
-  }
-  return warmupElapsed ? "ended" : "withdrawn";
 }
 
 export class GameService {
@@ -848,7 +820,12 @@ export class GameService {
                 ).toISOString(),
               }),
           role: row.aggressorPlayerId === actor.id ? "aggressor" : "defender",
-          state: hostilityState(declaredAtTick, withdrawnAtTick, effectiveTick, ruleset.combat),
+          state: hostilityWindowState(
+            declaredAtTick,
+            withdrawnAtTick,
+            effectiveTick,
+            ruleset.combat,
+          ),
         };
       }),
     };
@@ -1725,7 +1702,8 @@ export class GameService {
         .where("trustTier", "<", earnedTier)
         .execute();
     }
-    for (const allianceId of affectedAlliances) {
+    // Lock alliances in identifier order so two actions touching two alliances cannot deadlock.
+    for (const allianceId of [...affectedAlliances].sort()) {
       // Serialize alliance totals per alliance so two members' concurrent mutations cannot both
       // write a sum that omits the other's delta; the worker takes the same lock.
       await transaction

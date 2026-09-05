@@ -822,6 +822,36 @@ function redeclarationAllowedAt(withdrawn: HostilityState, ruleset: Ruleset): Ti
   );
 }
 
+export type HostilityWindowState =
+  | "warmup"
+  | "active"
+  | "withdrawn"
+  | "retaliation_window"
+  | "ended";
+
+/**
+ * Place the effective tick in a declaration's warmup and retaliation windows using the same
+ * boundaries `decide` enforces: the aggressor may attack from the tick the warmup elapses and the
+ * defender may retaliate through the final retaliation tick. This restates no decision: whether a
+ * given attack is permitted (counter-declarations, alliances, adjacency) is `decide`'s alone. A
+ * withdrawn declaration whose retaliation window has closed stays `withdrawn` until its original
+ * warmup would have elapsed, because the withdrawal binds the aggressor for exactly that long; with
+ * equal window lengths that gap is empty and the row moves straight to `ended`.
+ */
+export function hostilityWindowState(
+  declaredAtTick: Tick,
+  withdrawnAtTick: Tick | undefined,
+  effectiveTick: Tick,
+  combat: Pick<Ruleset["combat"], "hostilityWarmupTicks" | "retaliationAfterWithdrawalTicks">,
+): HostilityWindowState {
+  const warmupElapsed = effectiveTick >= declaredAtTick + combat.hostilityWarmupTicks;
+  if (withdrawnAtTick === undefined) return warmupElapsed ? "active" : "warmup";
+  if (effectiveTick <= withdrawnAtTick + combat.retaliationAfterWithdrawalTicks) {
+    return "retaliation_window";
+  }
+  return warmupElapsed ? "ended" : "withdrawn";
+}
+
 function attackPermission(
   hostilities: readonly HostilityState[],
   actorId: PlayerId,
