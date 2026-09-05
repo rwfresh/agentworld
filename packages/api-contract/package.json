@@ -1,0 +1,32 @@
+{
+  "name": "@agentworld/api-contract",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Runtime schemas and public HTTP contract for AgentWorld",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "test": "vitest run --root ../.. packages/api-contract/tests",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.52"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

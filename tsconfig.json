@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "files": [],
+  "references": [
+    { "path": "./packages/game-rules" },
+    { "path": "./packages/api-contract" },
+    { "path": "./packages/api-client" },
+    { "path": "./packages/db" },
+    { "path": "./apps/server" },
+    { "path": "./apps/cli" },
+    { "path": "./apps/auth-web" }
+  ]
+}

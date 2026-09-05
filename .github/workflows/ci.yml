@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, typecheck, test, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Install pnpm and Node.js
+        uses: pnpm/setup@v2.1.0
+        with:
+          runtime: node@24
+          cache: true
+          require-lockfile: true
+
+      - name: Run quality gate
+        run: pnpm check
+
+      - name: Build all workspaces
+        run: pnpm build
+
+  integration:
+    name: PostgreSQL and Valkey integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://agentworld:agentworld_dev@127.0.0.1:5432/agentworld
+      REDIS_URL: redis://127.0.0.1:6379
+      BASE_URL: http://127.0.0.1:3000
+      AUTH_SECRET: agentworld-ci-only-never-use-in-production
+      AUTH_MODE: development
+      REGISTRATION_MODE: open
+      RULESET_PATH: config/rulesets/beta-v1.yaml
+      SMTP_URL: smtp://127.0.0.1:1025
+      EMAIL_FROM: AgentWorld CI <agentworld@localhost>
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Install pnpm and Node.js
+        uses: pnpm/setup@v2.1.0
+        with:
+          runtime: node@24
+          cache: true
+          require-lockfile: true
+
+      - name: Start test dependencies
+        run: docker compose up --wait postgres valkey mailpit
+
+      - name: Run integration tests
+        run: pnpm test:integration
+
+      - name: Show dependency logs on failure
+        if: failure()
+        run: docker compose logs --no-color postgres valkey mailpit
+
+      - name: Stop test dependencies
+        if: always()
+        run: docker compose down --volumes

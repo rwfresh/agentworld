@@ -1,0 +1,20 @@
+{
+  "name": "@agentworld/auth-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Human authentication and device approval portal for AgentWorld",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0 --port 4173 --strictPort",
+    "preview": "vite preview --host 0.0.0.0 --port 4173 --strictPort",
+    "test": "vitest run --root ../.. apps/auth-web",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vite": "7.3.6",
+    "vitest": "catalog:"
+  }
+}

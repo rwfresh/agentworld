@@ -1,0 +1,36 @@
+{
+  "name": "@agentworld/db",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PostgreSQL persistence for AgentWorld",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./migrate": {
+      "types": "./dist/migrate.d.ts",
+      "import": "./dist/migrate.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "kysely": "0.29.5",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "8.15.6",
+    "typescript": "catalog:"
+  }
+}

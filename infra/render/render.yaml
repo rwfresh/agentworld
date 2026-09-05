@@ -1,0 +1,128 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+# Render Blueprint for the official-style single-region deployment.
+# Import this file explicitly from infra/render/render.yaml.
+
+previews:
+  generation: "off"
+
+envVarGroups:
+  - name: agentworld-runtime
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AUTH_MODE
+        value: better-auth
+      - key: REGISTRATION_MODE
+        value: invite
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "10000"
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      - key: RULESET_PATH
+        value: /app/config/rulesets/beta-v1.yaml
+      - key: AUTH_WEB_DIRECTORY
+        value: /app/apps/auth-web/dist
+      - key: INSTALLATION_NAME
+        value: AgentWorld
+
+services:
+  - type: web
+    name: agentworld-api
+    runtime: docker
+    region: ohio
+    plan: 0.5c-512mb
+    dockerfilePath: ./infra/docker/Dockerfile
+    dockerCommand: node apps/server/dist/api.js
+    preDeployCommand: node apps/server/dist/migrate.js && node apps/server/dist/seed.js
+    healthCheckPath: /ready
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: agentworld-runtime
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: WORLD_SEED_SECRET
+        generateValue: true
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agentworld-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: agentworld-key-value
+          type: keyvalue
+          property: connectionString
+      - key: BASE_URL
+        fromService:
+          name: agentworld-api
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: SMTP_URL
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
+  - type: worker
+    name: agentworld-worker
+    runtime: docker
+    region: ohio
+    plan: 0.5c-512mb
+    dockerfilePath: ./infra/docker/Dockerfile
+    dockerCommand: node apps/server/dist/worker.js
+    preDeployCommand: node apps/server/dist/migrate.js
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - fromGroup: agentworld-runtime
+      - key: AUTH_SECRET
+        fromService:
+          name: agentworld-api
+          type: web
+          envVarKey: AUTH_SECRET
+      - key: WORLD_SEED_SECRET
+        fromService:
+          name: agentworld-api
+          type: web
+          envVarKey: WORLD_SEED_SECRET
+      - key: METRICS_TOKEN
+        fromService:
+          name: agentworld-api
+          type: web
+          envVarKey: METRICS_TOKEN
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agentworld-postgres
+          property: connectionString
+      - key: BASE_URL
+        fromService:
+          name: agentworld-api
+          type: web
+          envVarKey: BASE_URL
+
+  - type: keyvalue
+    name: agentworld-key-value
+    region: ohio
+    plan: 256mb
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+    persistenceMode: "off"
+
+databases:
+  - name: agentworld-postgres
+    databaseName: agentworld
+    user: agentworld
+    region: ohio
+    plan: 0.5c-1g
+    diskSizeGB: 15
+    storageAutoscalingEnabled: true
+    postgresMajorVersion: "18"
+    ipAllowList: []
+    connectionPool: none

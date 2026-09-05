@@ -1,0 +1,35 @@
+{
+  "name": "agentworld",
+  "version": "0.1.0",
+  "description": "Command-line client for AgentWorld",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agentworld": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "dev": "tsx src/bin.ts",
+    "test": "vitest run --root ../.. apps/cli",
+    "typecheck": "tsc -b --pretty false && tsc -p tsconfig.test.json --pretty false"
+  },
+  "dependencies": {
+    "@agentworld/api-client": "workspace:*",
+    "@agentworld/api-contract": "workspace:*",
+    "commander": "14.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "tsx": "4.20.6",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
